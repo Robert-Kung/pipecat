@@ -53,6 +53,7 @@ class TestLiveKitVideoStreamMemoryLeak(unittest.IsolatedAsyncioTestCase):
             on_video_track_subscribed=AsyncMock(),
             on_video_track_unsubscribed=AsyncMock(),
             on_data_received=AsyncMock(),
+            on_sip_dtmf_received=AsyncMock(),
             on_first_participant_joined=AsyncMock(),
         )
         client = LiveKitTransportClient(
@@ -153,6 +154,7 @@ class TestLiveKitAudioStreamLeakOnUnsubscribe(unittest.IsolatedAsyncioTestCase):
             on_video_track_subscribed=AsyncMock(),
             on_video_track_unsubscribed=AsyncMock(),
             on_data_received=AsyncMock(),
+            on_sip_dtmf_received=AsyncMock(),
             on_first_participant_joined=AsyncMock(),
         )
         client = LiveKitTransportClient(
@@ -276,6 +278,53 @@ class TestLiveKitAudioStreamLeakOnUnsubscribe(unittest.IsolatedAsyncioTestCase):
         await client._async_on_track_unsubscribed(track, pub, participant)
         mock_stream.aclose.assert_awaited_once()
         self.assertNotIn(participant.sid, client._video_streams)
+
+
+@unittest.skipUnless(LIVEKIT_AVAILABLE, "livekit package not installed")
+class TestLiveKitSipDtmf(unittest.IsolatedAsyncioTestCase):
+    """The SIP DTMF event forwards the digit and sender to the callback."""
+
+    def _create_client(self) -> LiveKitTransportClient:
+        callbacks = LiveKitCallbacks(
+            on_connected=AsyncMock(),
+            on_disconnected=AsyncMock(),
+            on_before_disconnect=AsyncMock(),
+            on_participant_connected=AsyncMock(),
+            on_participant_disconnected=AsyncMock(),
+            on_audio_track_subscribed=AsyncMock(),
+            on_audio_track_unsubscribed=AsyncMock(),
+            on_video_track_subscribed=AsyncMock(),
+            on_video_track_unsubscribed=AsyncMock(),
+            on_data_received=AsyncMock(),
+            on_sip_dtmf_received=AsyncMock(),
+            on_first_participant_joined=AsyncMock(),
+        )
+        return LiveKitTransportClient(
+            url="wss://test.livekit.cloud",
+            token="test-token",
+            room_name="test-room",
+            params=LiveKitParams(),
+            callbacks=callbacks,
+            transport_name="test-transport",
+        )
+
+    async def test_dtmf_forwards_digit_and_participant(self):
+        client = self._create_client()
+        participant = MagicMock()
+        participant.sid = "PA_caller"
+        event = rtc.SipDTMF(code=1, digit="1", participant=participant)
+
+        await client._async_on_sip_dtmf_received(event)
+
+        client._callbacks.on_sip_dtmf_received.assert_awaited_once_with("1", "PA_caller")
+
+    async def test_dtmf_without_participant_uses_empty_id(self):
+        client = self._create_client()
+        event = rtc.SipDTMF(code=0, digit="0", participant=None)
+
+        await client._async_on_sip_dtmf_received(event)
+
+        client._callbacks.on_sip_dtmf_received.assert_awaited_once_with("0", "")
 
 
 if __name__ == "__main__":
