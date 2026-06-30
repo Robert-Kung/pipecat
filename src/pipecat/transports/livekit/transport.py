@@ -20,6 +20,7 @@ from typing import Any
 from loguru import logger
 from pydantic import BaseModel
 
+from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     AudioRawFrame,
@@ -29,6 +30,7 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     ImageRawFrame,
+    InputDTMFFrame,
     InterruptionFrame,
     OutputAudioRawFrame,
     OutputDTMFFrame,
@@ -126,6 +128,7 @@ class LiveKitCallbacks(BaseModel):
     on_video_track_subscribed: Callable[[str], Awaitable[None]]
     on_video_track_unsubscribed: Callable[[str], Awaitable[None]]
     on_data_received: Callable[[bytes, str], Awaitable[None]]
+    on_sip_dtmf_received: Callable[[str, str], Awaitable[None]]
     on_first_participant_joined: Callable[[str], Awaitable[None]]
 
 
@@ -222,6 +225,7 @@ class LiveKitTransportClient:
         self.room.on("track_subscribed")(self._on_track_subscribed_wrapper)
         self.room.on("track_unsubscribed")(self._on_track_unsubscribed_wrapper)
         self.room.on("data_received")(self._on_data_received_wrapper)
+        self.room.on("sip_dtmf_received")(self._on_sip_dtmf_received_wrapper)
         self.room.on("connected")(self._on_connected_wrapper)
         self.room.on("disconnected")(self._on_disconnected_wrapper)
 
@@ -469,6 +473,13 @@ class LiveKitTransportClient:
             f"{self}::_async_on_data_received",
         )
 
+    def _on_sip_dtmf_received_wrapper(self, sip_dtmf: rtc.SipDTMF):
+        """Wrapper for SIP DTMF events."""
+        self._task_manager.create_task(
+            self._async_on_sip_dtmf_received(sip_dtmf),
+            f"{self}::_async_on_sip_dtmf_received",
+        )
+
     def _on_connected_wrapper(self):
         """Wrapper for connected events."""
         self._task_manager.create_task(self._async_on_connected(), f"{self}::_async_on_connected")
@@ -586,6 +597,11 @@ class LiveKitTransportClient:
     async def _async_on_data_received(self, data: rtc.DataPacket):
         """Handle data received events."""
         await self._callbacks.on_data_received(data.data, data.participant.sid)
+
+    async def _async_on_sip_dtmf_received(self, sip_dtmf: rtc.SipDTMF):
+        """Handle SIP DTMF events."""
+        participant_id = sip_dtmf.participant.sid if sip_dtmf.participant else ""
+        await self._callbacks.on_sip_dtmf_received(sip_dtmf.digit, participant_id)
 
     async def _async_on_connected(self):
         """Handle connected events."""
@@ -1051,6 +1067,7 @@ class LiveKitTransport(BaseTransport):
             on_video_track_subscribed=self._on_video_track_subscribed,
             on_video_track_unsubscribed=self._on_video_track_unsubscribed,
             on_data_received=self._on_data_received,
+            on_sip_dtmf_received=self._on_sip_dtmf_received,
             on_first_participant_joined=self._on_first_participant_joined,
         )
         self._params = params or LiveKitParams()
@@ -1070,6 +1087,7 @@ class LiveKitTransport(BaseTransport):
         self._register_event_handler("on_video_track_subscribed")
         self._register_event_handler("on_video_track_unsubscribed")
         self._register_event_handler("on_data_received")
+        self._register_event_handler("on_sip_dtmf_received")
         self._register_event_handler("on_first_participant_joined")
         self._register_event_handler("on_participant_left")
         self._register_event_handler("on_call_state_updated")
@@ -1218,6 +1236,17 @@ class LiveKitTransport(BaseTransport):
         if self._input:
             await self._input.push_app_message(data.decode(), participant_id)
         await self._call_event_handler("on_data_received", data, participant_id)
+
+    async def _on_sip_dtmf_received(self, digit: str, participant_id: str):
+        """Handle SIP DTMF events by pushing an InputDTMFFrame downstream."""
+        try:
+            button = KeypadEntry(digit)
+        except ValueError:
+            logger.warning(f"Ignoring unsupported SIP DTMF digit: {digit!r}")
+            return
+        await self._call_event_handler("on_sip_dtmf_received", digit, participant_id)
+        if self._input:
+            await self._input.push_frame(InputDTMFFrame(button=button))
 
     async def send_message(self, message: str, participant_id: str | None = None):
         """Send a message to participants in the room.
