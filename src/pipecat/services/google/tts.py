@@ -24,12 +24,14 @@ os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from loguru import logger
 from pydantic import BaseModel
 
 from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
     ErrorFrame,
     Frame,
     StartFrame,
@@ -47,10 +49,12 @@ from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.deprecation import deprecated
 
 try:
+    import google.genai as genai
     from google.api_core.client_options import ClientOptions
     from google.auth import default
     from google.auth.exceptions import GoogleAuthError
     from google.cloud import texttospeech_v1
+    from google.genai.types import HttpOptions
     from google.oauth2 import service_account
 
 except ModuleNotFoundError as e:
@@ -1285,6 +1289,7 @@ class GeminiTTSService(GoogleBaseTTSService):
         self,
         *,
         model: str | None = None,
+        api_key: str | None = None,
         credentials: str | None = None,
         credentials_path: str | None = None,
         location: str | None = None,
@@ -1292,6 +1297,8 @@ class GeminiTTSService(GoogleBaseTTSService):
         sample_rate: int | None = None,
         params: InputParams | None = None,
         settings: Settings | None = None,
+        use_genai: bool | None = None,
+        http_options: HttpOptions | None = None,
         **kwargs,
     ):
         """Initializes the Gemini TTS service.
@@ -1322,8 +1329,25 @@ class GeminiTTSService(GoogleBaseTTSService):
 
             settings: Runtime-updatable settings. When provided alongside deprecated
                 parameters, ``settings`` values take precedence.
+            api_key: Google AI API key for authentication when using GenAI.
+            use_genai: Force use of the google-genai client if True.
+            http_options: HTTP client options for the google-genai client.
             **kwargs: Additional arguments passed to parent TTSService.
         """
+        # Backend selection: an explicit ``use_genai`` wins; otherwise passing an
+        # ``api_key`` opts into the GenAI client. We deliberately don't auto-select
+        # GenAI from the GOOGLE_API_KEY env var alone — that var is commonly set for
+        # other Google services (e.g. the LLM), and reading it here would silently
+        # flip the backend out from under a GCP-credentialed user.
+        if use_genai is not None:
+            self._use_genai = use_genai
+        else:
+            self._use_genai = api_key is not None
+
+        # The API key (param, then env) is only meaningful for the GenAI backend.
+        self._api_key = (api_key or os.environ.get("GOOGLE_API_KEY")) if self._use_genai else None
+        self._http_options = http_options
+
         if sample_rate and sample_rate != self.GOOGLE_SAMPLE_RATE:
             logger.warning(
                 f"Google TTS only supports {self.GOOGLE_SAMPLE_RATE}Hz sample rate. "
@@ -1379,9 +1403,72 @@ class GeminiTTSService(GoogleBaseTTSService):
         )
 
         self._location = location
-        self._client: texttospeech_v1.TextToSpeechAsyncClient = self._create_client(
-            credentials, credentials_path
+        self._client = self._create_client(credentials, credentials_path)
+
+        # Warn once now about settings the GenAI backend ignores, rather than on
+        # every utterance in run_tts.
+        self._warn_unsupported_genai_settings(
+            multi_speaker=assert_given(default_settings.multi_speaker),
+            prompt=assert_given(default_settings.prompt),
         )
+
+    def _create_client(
+        self, credentials: str | None, credentials_path: str | None
+    ) -> "texttospeech_v1.TextToSpeechAsyncClient | genai.Client":
+        if self._use_genai:
+            return genai.Client(api_key=self._api_key, http_options=self._http_options)
+        else:
+            return super()._create_client(credentials, credentials_path)
+
+    async def stop(self, frame: EndFrame):
+        """Stop the Gemini TTS service.
+
+        Args:
+            frame: The end frame.
+        """
+        await super().stop(frame)
+        await self._close_client()
+
+    async def cancel(self, frame: CancelFrame):
+        """Cancel the Gemini TTS service.
+
+        Args:
+            frame: The cancel frame.
+        """
+        await super().cancel(frame)
+        await self._close_client()
+
+    async def _close_client(self):
+        # Only the GenAI client owns a closable async session; the GCP client
+        # manages its own lifecycle.
+        if self._use_genai:
+            client = cast("genai.Client", self._client)
+            try:
+                await client.aio.aclose()
+            except Exception:
+                # Do nothing - we're shutting down anyway.
+                pass
+
+    def _warn_unsupported_genai_settings(
+        self, *, multi_speaker: bool | None, prompt: str | None
+    ) -> None:
+        """Warn about settings the GenAI backend silently ignores.
+
+        The Gemini API (GenAI) backend supports neither multi-speaker output nor
+        prompt/style instructions. This is a no-op on the GCP backend.
+        """
+        if not self._use_genai:
+            return
+        if multi_speaker:
+            logger.warning(
+                f"{self}: Multi-speaker is not supported by the Gemini API (GenAI) TTS "
+                "backend; using a single speaker."
+            )
+        if prompt:
+            logger.warning(
+                f"{self}: Prompt/style instructions are not supported by the Gemini API "
+                "(GenAI) TTS backend."
+            )
 
     def language_to_service_language(self, language: Language) -> str | None:
         """Convert a Language enum to Gemini TTS language format.
@@ -1419,6 +1506,12 @@ class GeminiTTSService(GoogleBaseTTSService):
         if is_given(delta.voice) and delta.voice not in self.AVAILABLE_VOICES:
             logger.warning(f"Voice '{delta.voice}' not in known voices list. Using anyway.")
 
+        if isinstance(delta, self.Settings):
+            self._warn_unsupported_genai_settings(
+                multi_speaker=delta.multi_speaker if is_given(delta.multi_speaker) else None,
+                prompt=delta.prompt if is_given(delta.prompt) else None,
+            )
+
         return await super()._update_settings(delta)
 
     @traced_tts
@@ -1433,7 +1526,15 @@ class GeminiTTSService(GoogleBaseTTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech as it's generated.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
+        if self._use_genai:
+            async for frame in self._run_genai_tts(text, context_id):
+                yield frame
+        else:
+            async for frame in self._run_gcp_tts(text, context_id):
+                yield frame
+
+    async def _run_gcp_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        logger.debug(f"{self}: Generating GCP TTS [{text}]")
 
         try:
             # Build voice selection params
@@ -1481,5 +1582,67 @@ class GeminiTTSService(GoogleBaseTTSService):
                 yield frame
 
         except Exception as e:
-            error_message = f"Gemini TTS generation error: {str(e)}"
-            yield ErrorFrame(error=error_message)
+            yield ErrorFrame(error=f"Gemini GCP TTS generation error: {str(e)}")
+
+    async def _run_genai_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        logger.debug(f"{self}: Generating GenAI TTS [{text}]")
+
+        try:
+            config = genai.types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=genai.types.SpeechConfig(
+                    language_code=assert_given(self._settings.language),
+                    voice_config=genai.types.VoiceConfig(
+                        prebuilt_voice_config=genai.types.PrebuiltVoiceConfig(
+                            voice_name=assert_given(self._settings.voice)
+                        )
+                    ),
+                ),
+            )
+
+            await self.start_tts_usage_metrics(text)
+
+            client = cast("genai.Client", self._client)
+
+            model = assert_given(self._settings.model)
+            assert model is not None
+
+            response = await client.aio.models.generate_content_stream(
+                model=model,
+                contents=text,
+                config=config,
+            )
+
+            audio_buffer = b""
+            first_chunk_for_ttfb = False
+            CHUNK_SIZE = self.chunk_size
+
+            async for chunk in response:
+                if (
+                    chunk.candidates
+                    and chunk.candidates[0].content
+                    and chunk.candidates[0].content.parts
+                ):
+                    for part in chunk.candidates[0].content.parts:
+                        if part.inline_data:
+                            audio_bytes = part.inline_data.data
+                            if not audio_bytes:
+                                continue
+
+                            if not first_chunk_for_ttfb:
+                                await self.stop_ttfb_metrics()
+                                first_chunk_for_ttfb = True
+
+                            audio_buffer += audio_bytes
+                            while len(audio_buffer) >= CHUNK_SIZE:
+                                piece = audio_buffer[:CHUNK_SIZE]
+                                audio_buffer = audio_buffer[CHUNK_SIZE:]
+                                yield TTSAudioRawFrame(
+                                    piece, self.sample_rate, 1, context_id=context_id
+                                )
+
+            if audio_buffer:
+                yield TTSAudioRawFrame(audio_buffer, self.sample_rate, 1, context_id=context_id)
+
+        except Exception as e:
+            yield ErrorFrame(error=f"Gemini GenAI TTS generation error: {str(e)}")
