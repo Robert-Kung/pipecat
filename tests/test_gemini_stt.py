@@ -301,3 +301,30 @@ async def test_update_settings_requests_reconnect_only_on_change():
     with patch.object(STTService, "_update_settings", AsyncMock(return_value={})):
         await service._update_settings(GeminiSTTService.Settings())
     service._request_reconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_receive_handler_reports_fatal_error_after_max_failures():
+    # Fork-specific: push_error has no force_treat_as_permanent; the max-failure
+    # path must use fatal=True and stop retrying.
+    from pipecat.services.google.gemini_live.stt import MAX_CONSECUTIVE_FAILURES
+
+    service, _, _ = make_service()
+    service._consecutive_failures = 0
+    service._open_session = AsyncMock(side_effect=RuntimeError("boom"))
+    service._close_session = AsyncMock()
+    service._call_event_handler = AsyncMock()
+    error_frames = []
+
+    async def push_error_frame(error):
+        error_frames.append(error)
+
+    service.push_error_frame = push_error_frame
+
+    await service._receive_handler()
+
+    assert service._open_session.await_count == MAX_CONSECUTIVE_FAILURES
+    assert [frame.fatal for frame in error_frames] == [False] * (
+        MAX_CONSECUTIVE_FAILURES - 1
+    ) + [True]
+    service._call_event_handler.assert_awaited_with("on_connection_error", "boom")

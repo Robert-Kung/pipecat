@@ -466,9 +466,9 @@ class GeminiSTTService(STTService):
                         f"({MAX_CONSECUTIVE_FAILURES}) reached: {e}"
                     )
                     await self._call_event_handler("on_connection_error", str(e))
-                    await self.push_error(
-                        error_msg=error_msg, exception=e, force_treat_as_permanent=True
-                    )
+                    # The fork's push_error predates upstream's
+                    # force_treat_as_permanent; fatal=True is its equivalent.
+                    await self.push_error(error_msg=error_msg, exception=e, fatal=True)
                     return
                 logger.warning(
                     f"{self}: connection lost, will retry "
