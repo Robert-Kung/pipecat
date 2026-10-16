@@ -6,6 +6,7 @@
 
 """Tests for Gemini Live STT transcription handling and config building."""
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -32,6 +33,13 @@ def make_service(**settings_kwargs):
 
     service._session = None
     service._sample_rate = 16000
+    # object.__new__ skips __init__: mirror the connection-state fields it sets
+    service._stopped = False
+    service._go_away_session = None
+    service._drain_tasks = set()
+    service._pending_audio = deque()
+    service._pending_audio_bytes = 0
+    service._task_serial = 0
 
     frames = []
     transcriptions = []

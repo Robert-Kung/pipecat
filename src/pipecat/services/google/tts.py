@@ -1655,9 +1655,10 @@ class GeminiTTSService(GoogleBaseTTSService):
             block_reason = None
 
             async for chunk in response:
-                if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
-                    block_reason = chunk.prompt_feedback.block_reason
-                if chunk.candidates and chunk.candidates[0].finish_reason:
+                feedback = getattr(chunk, "prompt_feedback", None)
+                if feedback and getattr(feedback, "block_reason", None):
+                    block_reason = feedback.block_reason
+                if chunk.candidates and getattr(chunk.candidates[0], "finish_reason", None):
                     finish_reason = chunk.candidates[0].finish_reason
                 if (
                     chunk.candidates
