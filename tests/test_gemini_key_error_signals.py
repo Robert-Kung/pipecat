@@ -114,9 +114,10 @@ class FakeSession:
 def final_transcript(text):
     transcription = SimpleNamespace(text=text, language_code=None)
     return SimpleNamespace(
+        go_away=None,
         server_content=SimpleNamespace(
             interim_input_transcription=None, input_transcription=transcription
-        )
+        ),
     )
 
 

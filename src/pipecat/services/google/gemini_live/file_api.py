@@ -24,6 +24,10 @@ class GeminiFileAPI:
     This class provides methods for uploading, fetching, listing, and deleting files
     through Google's Gemini File API.
 
+    The API key is sent in the ``x-goog-api-key`` header, never in the URL, and
+    requests honor the proxy environment variables (``HTTPS_PROXY``,
+    ``NO_PROXY``), like the google-genai client.
+
     Files uploaded through this API remain available for 48 hours and can be referenced
     in calls to the Gemini generative models. Maximum file size is 2GB, with total
     project storage limited to 20GB.
@@ -43,6 +47,10 @@ class GeminiFileAPI:
         # Upload URL uses the /upload/ path
         self.upload_base_url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 
+    def _session(self) -> aiohttp.ClientSession:
+        """Create a session that sends the key as a header and honors the proxy env."""
+        return aiohttp.ClientSession(trust_env=True, headers={"x-goog-api-key": self._api_key})
+
     async def upload_file(self, file_path: str, display_name: str | None = None) -> dict[str, Any]:
         """Upload a file to the Gemini File API using the correct resumable upload protocol.
 
@@ -55,7 +63,7 @@ class GeminiFileAPI:
         """
         logger.info(f"Uploading file: {file_path}")
 
-        async with aiohttp.ClientSession() as session:
+        async with self._session() as session:
             # Determine the file's MIME type
             mime_type, _ = mimetypes.guess_type(file_path)
             if not mime_type:
@@ -81,7 +89,7 @@ class GeminiFileAPI:
 
             logger.debug(f"Step 1: Getting upload URL from {self.upload_base_url}")
             async with session.post(
-                f"{self.upload_base_url}?key={self._api_key}", headers=headers, json=metadata
+                self.upload_base_url, headers=headers, json=metadata
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
@@ -127,8 +135,8 @@ class GeminiFileAPI:
         if "/" in name:
             name = name.split("/")[-1]
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self._base_url}/{name}?key={self._api_key}") as response:
+        async with self._session() as session:
+            async with session.get(f"{self._base_url}/{name}") as response:
                 if response.status != 200:
                     error_text = await response.text()
                     logger.error(f"Error getting file metadata: {error_text}")
@@ -149,12 +157,12 @@ class GeminiFileAPI:
         Returns:
             List of files and next page token if available
         """
-        params = {"key": self._api_key, "pageSize": page_size}
+        params: dict[str, Any] = {"pageSize": page_size}
 
         if page_token:
             params["pageToken"] = page_token
 
-        async with aiohttp.ClientSession() as session:
+        async with self._session() as session:
             async with session.get(self._base_url, params=params) as response:
                 if response.status != 200:
                     error_text = await response.text()
@@ -177,8 +185,8 @@ class GeminiFileAPI:
         if "/" in name:
             name = name.split("/")[-1]
 
-        async with aiohttp.ClientSession() as session:
-            async with session.delete(f"{self._base_url}/{name}?key={self._api_key}") as response:
+        async with self._session() as session:
+            async with session.delete(f"{self._base_url}/{name}") as response:
                 if response.status != 200:
                     error_text = await response.text()
                     logger.error(f"Error deleting file: {error_text}")

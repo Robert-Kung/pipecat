@@ -552,6 +552,29 @@ class GeminiTTSSettings(TTSSettings):
     )
 
 
+class GeminiTTSNoAudioError(Exception):
+    """A Gemini TTS response that ended without any audio.
+
+    Parameters:
+        finish_reason: The last finish reason the response reported, if any.
+        block_reason: The prompt block reason the response reported, if any.
+    """
+
+    def __init__(self, finish_reason: Any = None, block_reason: Any = None):
+        """Initialize the error.
+
+        Args:
+            finish_reason: The last finish reason the response reported, if any.
+            block_reason: The prompt block reason the response reported, if any.
+        """
+        self.finish_reason = finish_reason
+        self.block_reason = block_reason
+        super().__init__(
+            "Gemini TTS response contained no audio "
+            f"(finish_reason={finish_reason}, block_reason={block_reason})"
+        )
+
+
 class GoogleHttpTTSService(TTSService):
     """Google Cloud Text-to-Speech HTTP service with SSML support.
 
@@ -1628,8 +1651,14 @@ class GeminiTTSService(GoogleBaseTTSService):
             audio_buffer = b""
             first_chunk_for_ttfb = False
             CHUNK_SIZE = self.chunk_size
+            finish_reason = None
+            block_reason = None
 
             async for chunk in response:
+                if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                    block_reason = chunk.prompt_feedback.block_reason
+                if chunk.candidates and chunk.candidates[0].finish_reason:
+                    finish_reason = chunk.candidates[0].finish_reason
                 if (
                     chunk.candidates
                     and chunk.candidates[0].content
@@ -1655,6 +1684,12 @@ class GeminiTTSService(GoogleBaseTTSService):
 
             if audio_buffer:
                 yield TTSAudioRawFrame(audio_buffer, self.sample_rate, 1, context_id=context_id)
+
+            if not first_chunk_for_ttfb:
+                # A response without audio (e.g. blocked, or cut off by a
+                # finish reason) is a failure too, so the application can tell
+                # TTS is unusable instead of only noticing silence.
+                raise GeminiTTSNoAudioError(finish_reason=finish_reason, block_reason=block_reason)
 
         except Exception as e:
             # Non-fatal, with the original exception attached (e.g. a
