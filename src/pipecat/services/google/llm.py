@@ -285,8 +285,21 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         return True
 
     def create_client(self):
-        """Create the Gemini client instance. Subclasses can override this."""
-        self._client = genai.Client(api_key=self._api_key, http_options=self._http_options)
+        """Create the Gemini client instance. Subclasses can override this.
+
+        Only the ``api_key`` passed in is used. An empty key raises instead of
+        letting google-genai fall back to the ``GOOGLE_API_KEY``/``GEMINI_API_KEY``
+        environment variables, and ``vertexai=False`` keeps
+        ``GOOGLE_GENAI_USE_VERTEXAI`` from switching the client to Vertex AI (or ADC).
+
+        Raises:
+            ValueError: If ``api_key`` is empty.
+        """
+        if not self._api_key or not self._api_key.strip():
+            raise ValueError("GoogleLLMService requires a non-empty api_key")
+        self._client = genai.Client(
+            api_key=self._api_key, vertexai=False, http_options=self._http_options
+        )
 
     async def run_inference(
         self,

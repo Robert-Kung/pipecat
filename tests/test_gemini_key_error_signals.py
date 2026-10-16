@@ -279,6 +279,55 @@ def test_tts_genai_client_is_pinned_to_the_gemini_api(mock_client_class):
     assert kwargs["vertexai"] is False
 
 
+# The LLM (``google`` provider, Gemini API key) shares the same key and the same
+# rule (gemini-key-voice 1.2, SEC-8 LLM side).
+
+
+@pytest.mark.parametrize("api_key", ["", "   ", None])
+@patch("google.genai.Client")
+def test_llm_empty_api_key_is_rejected(mock_client_class, api_key):
+    from pipecat.services.google.llm import GoogleLLMService
+
+    with patch.dict(os.environ, HOSTILE_ENV):
+        with pytest.raises(ValueError, match="non-empty api_key"):
+            GoogleLLMService(api_key=api_key)
+    mock_client_class.assert_not_called()
+
+
+@patch("google.genai.Client")
+def test_llm_client_is_pinned_to_the_gemini_api(mock_client_class):
+    from pipecat.services.google.llm import GoogleLLMService
+
+    with patch.dict(os.environ, HOSTILE_ENV):
+        GoogleLLMService(api_key=FAKE_KEY)
+    _, kwargs = mock_client_class.call_args
+    assert kwargs["api_key"] == FAKE_KEY
+    assert kwargs["vertexai"] is False
+
+
+def test_llm_real_client_ignores_vertex_environment():
+    from pipecat.services.google.llm import GoogleLLMService
+
+    with patch.dict(os.environ, HOSTILE_ENV):
+        llm = GoogleLLMService(api_key=FAKE_KEY)
+    api_client = llm._client._api_client
+    assert api_client.vertexai is False
+    assert api_client.api_key == FAKE_KEY
+
+
+def test_vertex_llm_still_uses_vertex_client():
+    from pipecat.services.google.vertex import llm as vertex_llm
+
+    with (
+        patch.object(vertex_llm.GoogleVertexLLMService, "_get_credentials", return_value=None),
+        patch.object(vertex_llm, "Client") as mock_client_class,
+    ):
+        vertex_llm.GoogleVertexLLMService(project_id="demo-project", location="us-east4")
+    _, kwargs = mock_client_class.call_args
+    assert kwargs["vertexai"] is True
+    assert kwargs["project"] == "demo-project"
+
+
 # --- D8: the key travels in a header, never in the URL -----------------------
 
 
