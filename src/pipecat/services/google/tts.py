@@ -1330,6 +1330,8 @@ class GeminiTTSService(GoogleBaseTTSService):
             settings: Runtime-updatable settings. When provided alongside deprecated
                 parameters, ``settings`` values take precedence.
             api_key: Google AI API key for authentication when using GenAI.
+                Required (non-empty) for the GenAI backend; the
+                ``GOOGLE_API_KEY`` environment variable is not consulted.
             use_genai: Force use of the google-genai client if True.
             http_options: HTTP client options for the google-genai client.
             **kwargs: Additional arguments passed to parent TTSService.
@@ -1344,8 +1346,14 @@ class GeminiTTSService(GoogleBaseTTSService):
         else:
             self._use_genai = api_key is not None
 
-        # The API key (param, then env) is only meaningful for the GenAI backend.
-        self._api_key = (api_key or os.environ.get("GOOGLE_API_KEY")) if self._use_genai else None
+        # The API key is only meaningful for the GenAI backend, and only the key
+        # passed in is used: no GOOGLE_API_KEY fallback, so an empty key fails
+        # here instead of silently running on some other credential.
+        if self._use_genai and (not api_key or not api_key.strip()):
+            raise ValueError(
+                "GeminiTTSService requires a non-empty api_key for the Gemini API (GenAI) backend"
+            )
+        self._api_key = api_key if self._use_genai else None
         self._http_options = http_options
 
         if sample_rate and sample_rate != self.GOOGLE_SAMPLE_RATE:
@@ -1416,7 +1424,11 @@ class GeminiTTSService(GoogleBaseTTSService):
         self, credentials: str | None, credentials_path: str | None
     ) -> "texttospeech_v1.TextToSpeechAsyncClient | genai.Client":
         if self._use_genai:
-            return genai.Client(api_key=self._api_key, http_options=self._http_options)
+            # vertexai=False: without it google-genai reads GOOGLE_GENAI_USE_VERTEXAI
+            # and could switch this key to Vertex AI (or to ADC).
+            return genai.Client(
+                api_key=self._api_key, vertexai=False, http_options=self._http_options
+            )
         else:
             return super()._create_client(credentials, credentials_path)
 
@@ -1645,4 +1657,7 @@ class GeminiTTSService(GoogleBaseTTSService):
                 yield TTSAudioRawFrame(audio_buffer, self.sample_rate, 1, context_id=context_id)
 
         except Exception as e:
-            yield ErrorFrame(error=f"Gemini GenAI TTS generation error: {str(e)}")
+            # Non-fatal, with the original exception attached (e.g. a
+            # google.genai ClientError with code 400/403 for an invalid key, 429
+            # for an exhausted quota) so the application can tell why TTS failed.
+            yield ErrorFrame(error=f"Gemini GenAI TTS generation error: {str(e)}", exception=e)

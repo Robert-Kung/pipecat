@@ -113,13 +113,17 @@ def test_env_var_does_not_select_genai_backend(mock_gcp_client_class, mock_from_
 
 
 @patch("google.genai.Client")
-def test_use_genai_true_resolves_env_api_key(mock_genai_client_class):
-    """``use_genai=True`` selects GenAI and resolves the key from the env."""
-    with patch.dict(os.environ, {"GOOGLE_API_KEY": "env-key"}):
-        tts = GeminiTTSService(use_genai=True)
+def test_use_genai_true_without_api_key_does_not_read_env(mock_genai_client_class):
+    """``use_genai=True`` without ``api_key`` fails instead of using GOOGLE_API_KEY.
 
-    assert tts._use_genai
-    assert tts._api_key == "env-key"
+    Fork change (gemini-key-voice SEC-8): the GenAI backend only uses the key it
+    is given, never a key picked up from the environment.
+    """
+    with patch.dict(os.environ, {"GOOGLE_API_KEY": "env-key"}):
+        with pytest.raises(ValueError, match="non-empty api_key"):
+            GeminiTTSService(use_genai=True)
+
+    mock_genai_client_class.assert_not_called()
 
 
 @patch("google.oauth2.service_account.Credentials.from_service_account_info")

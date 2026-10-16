@@ -12,7 +12,6 @@ language detection, language hints, and adaptation phrases.
 """
 
 import asyncio
-import time
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
@@ -25,21 +24,21 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InterimTranscriptionFrame,
+    StartFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.stt import language_to_google_stt_language
 from pipecat.services.google.utils import update_google_client_http_options
-from pipecat.services.settings import STTSettings
+from pipecat.services.settings import NOT_GIVEN, STTSettings, assert_given, is_given
+from pipecat.services.settings import _NotGiven as NotGiven
 from pipecat.services.stt_latency import GEMINI_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
-from pipecat.services.settings import NOT_GIVEN, assert_given, is_given
-from pipecat.services.settings import _NotGiven as NotGiven
 
 try:
     from google.genai import Client
@@ -68,9 +67,12 @@ except ImportError:
     LanguageHints = None
 
 
-# Connection management constants
-MAX_CONSECUTIVE_FAILURES = 3
-CONNECTION_ESTABLISHED_THRESHOLD = 10.0  # seconds
+# Seconds between a failed connection or stream and the next connection
+# attempt. Every failure pushes one non-fatal ErrorFrame, so a dead key or an
+# exhausted quota produces about one ErrorFrame per second until the service is
+# stopped -- the same cadence as the Cloud STT service's reconnect loop, which
+# lets the application count consecutive STT errors the same way for both.
+RECONNECT_INTERVAL_SECONDS = 1.0
 
 
 @dataclass
@@ -114,6 +116,15 @@ class GeminiSTTService(STTService):
 
     Audio is sent at the pipeline's input sample rate; the model performs best
     with 16 kHz mono PCM.
+
+    Failures: every failed connection attempt (including the first one, made
+    when the pipeline starts) and every stream error pushes one non-fatal
+    ``ErrorFrame`` carrying the original exception, then the service retries
+    after ``RECONNECT_INTERVAL_SECONDS``. There is no retry cap: deciding when
+    repeated STT errors end the call (and stopping the service) is left to the
+    application. Errors are non-fatal on purpose -- a fatal ``ErrorFrame`` makes
+    the pipeline worker cancel the whole pipeline before the application can
+    transfer the call. Once stopped or cancelled the service never reconnects.
     """
 
     Settings = GeminiSTTSettings
@@ -147,12 +158,17 @@ class GeminiSTTService(STTService):
 
         Raises:
             ImportError: If the installed google-genai version is older than 2.9.0.
+            ValueError: If ``api_key`` is empty.
         """
         if LanguageAuto is None:
             raise ImportError(
                 "GeminiSTTService requires google-genai >= 2.9.0. "
                 'Upgrade with `uv add "google-genai>=2.9.0"`.'
             )
+        if not api_key or not api_key.strip():
+            # google-genai would fall back to the GOOGLE_API_KEY/GEMINI_API_KEY
+            # environment variables; this service only uses the key it is given.
+            raise ValueError("GeminiSTTService requires a non-empty api_key")
 
         default_settings = self.Settings(
             model="gemini-3.5-transcribe-live",
@@ -182,8 +198,8 @@ class GeminiSTTService(STTService):
         # before it returns.
         self._session_ctx: AbstractAsyncContextManager[AsyncSession] | None = None
         self._receive_task: asyncio.Task | None = None
-        self._connection_start_time: float | None = None
-        self._consecutive_failures = 0
+        # Set by stop()/cancel()/cleanup(); once set no new session is opened.
+        self._stopped = False
 
     def _create_client(self):
         """Create the google-genai client.
@@ -191,7 +207,11 @@ class GeminiSTTService(STTService):
         Subclasses (e.g. a Vertex AI variant) can override this to customize
         client construction and authentication.
         """
-        self._client = Client(api_key=self._api_key, http_options=self._http_options)
+        # vertexai=False: without it google-genai reads GOOGLE_GENAI_USE_VERTEXAI
+        # and could switch this key to Vertex AI (or to ADC when no key is set).
+        self._client = Client(
+            api_key=self._api_key, vertexai=False, http_options=self._http_options
+        )
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -212,13 +232,17 @@ class GeminiSTTService(STTService):
         """
         return language_to_google_stt_language(language)
 
-    async def setup(self, setup: FrameProcessorSetup):
-        """Set up the service and connect.
+    async def start(self, frame: StartFrame):
+        """Start the service and connect.
+
+        Connecting here rather than in ``setup()`` means a connection failure
+        (e.g. an invalid API key) is reported as an ``ErrorFrame`` through the
+        started pipeline instead of escaping pipeline setup.
 
         Args:
-            setup: Configuration object containing setup parameters.
+            frame: The start frame.
         """
-        await super().setup(setup)
+        await super().start(frame)
         await self._connect()
 
     async def stop(self, frame: EndFrame):
@@ -227,6 +251,7 @@ class GeminiSTTService(STTService):
         Args:
             frame: The end frame.
         """
+        self._stopped = True
         await super().stop(frame)
         await self._disconnect()
 
@@ -236,11 +261,13 @@ class GeminiSTTService(STTService):
         Args:
             frame: The cancel frame.
         """
+        self._stopped = True
         await super().cancel(frame)
         await self._disconnect()
 
     async def cleanup(self):
         """Release Gemini STT resources."""
+        self._stopped = True
         await super().cleanup()
         await self._disconnect()
 
@@ -257,7 +284,7 @@ class GeminiSTTService(STTService):
         yield None
 
     async def _send_audio(self, audio: bytes):
-        """Send audio to the live session, reconnecting on failure."""
+        """Send audio to the live session; a failed send closes the session."""
         session = self._session
         if session is None:
             return
@@ -267,9 +294,8 @@ class GeminiSTTService(STTService):
                 audio=Blob(data=audio, mime_type=f"audio/pcm;rate={self.sample_rate}")
             )
         except Exception as e:
-            logger.warning(f"{self}: audio send failed, reconnecting: {e}")
-            self._session = None
-            await self._request_reconnect()
+            logger.warning(f"{self}: audio send failed, closing the session: {e}")
+            await self._close_session(e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames with Gemini-specific handling.
@@ -298,9 +324,8 @@ class GeminiSTTService(STTService):
         try:
             await self._session.send_realtime_input(audio_stream_end=True)
         except Exception as e:
-            logger.warning(f"{self}: audio stream end failed, reconnecting: {e}")
-            self._session = None
-            await self._request_reconnect()
+            logger.warning(f"{self}: audio stream end failed, closing the session: {e}")
+            await self._close_session(e)
 
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
         """Apply a settings delta and reconnect if anything changed.
@@ -365,15 +390,23 @@ class GeminiSTTService(STTService):
     async def _connect(self):
         """Open the Live session, then start receiving on it.
 
-        Returns once the session can accept audio, so callers never have to
-        wait for it separately.
+        When the session opens, returns with it able to accept audio, so callers
+        never have to wait for it separately. When it fails to open, the failure
+        is reported like any other (one non-fatal ``ErrorFrame``) and the
+        receive task retries after ``RECONNECT_INTERVAL_SECONDS``. Never raises
+        for a connection failure, and does nothing once the service is stopped.
         """
-        if self._receive_task:
+        if self._stopped or self._receive_task:
             return
 
         logger.debug(f"{self}: connecting to Gemini")
-        await self._open_session()
-        self._receive_task = self.create_task(self._receive_handler())
+        retry_delay = 0.0
+        try:
+            await self._open_session()
+        except Exception as e:
+            await self._report_connection_failure(e)
+            retry_delay = RECONNECT_INTERVAL_SECONDS
+        self._receive_task = self.create_task(self._receive_handler(retry_delay))
         self._create_keepalive_task()
 
     async def _disconnect(self):
@@ -396,9 +429,12 @@ class GeminiSTTService(STTService):
         assert model is not None, "GeminiSTTService requires a model"
 
         config = self._build_live_config()
-        self._session_ctx = self._client.aio.live.connect(model=model, config=config)
-        self._session = await self._session_ctx.__aenter__()
-        self._connection_start_time = time.time()
+        ctx = self._client.aio.live.connect(model=model, config=config)
+        # A context whose __aenter__ raised was never entered, so it is only
+        # recorded (to be exited later) once the session is live.
+        session = await ctx.__aenter__()
+        self._session_ctx = ctx
+        self._session = session
         await self._call_event_handler("on_connected")
         logger.debug(f"{self}: connected to Gemini")
         return self._session
@@ -437,14 +473,26 @@ class GeminiSTTService(STTService):
         await self._disconnect()
         await self._connect()
 
-    async def _receive_handler(self):
-        """Receive server messages, reopening the session after transient errors.
+    async def _receive_handler(self, retry_delay: float = 0.0):
+        """Receive server messages, reopening the session after errors.
 
-        Repeated rapid failures are treated as fatal. Exits cleanly when the
-        task is cancelled (i.e. on stop/cancel).
+        Every failure -- the session failing to open, or the stream failing
+        (including the server closing it) -- is reported as one non-fatal
+        ``ErrorFrame`` and retried after ``RECONNECT_INTERVAL_SECONDS``, with no
+        retry cap. Exits when the task is cancelled (i.e. on stop/cancel) or
+        once the service is stopped.
+
+        Args:
+            retry_delay: Seconds to wait before the first attempt (used when the
+                initial connection in ``_connect()`` already failed).
         """
-        while True:
+        while not self._stopped:
             try:
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = 0.0
+                    if self._stopped:
+                        return
                 session = self._session
                 if session is None:
                     logger.debug(f"{self}: reopening the Gemini session")
@@ -453,37 +501,27 @@ class GeminiSTTService(STTService):
                 while True:
                     turn = session.receive()
                     async for message in turn:
-                        self._check_and_reset_failure_counter()
                         await self._handle_server_message(message)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 await self._close_session(e)
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    error_msg = (
-                        f"Max consecutive connection failures "
-                        f"({MAX_CONSECUTIVE_FAILURES}) reached: {e}"
-                    )
-                    await self._call_event_handler("on_connection_error", str(e))
-                    # The fork's push_error predates upstream's
-                    # force_treat_as_permanent; fatal=True is its equivalent.
-                    await self.push_error(error_msg=error_msg, exception=e, fatal=True)
-                    return
-                logger.warning(
-                    f"{self}: connection lost, will retry "
-                    f"({self._consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
-                )
-                await self.push_error(error_msg=f"connection error: {e}", exception=e)
+                await self._report_connection_failure(e)
+                retry_delay = RECONNECT_INTERVAL_SECONDS
 
-    def _check_and_reset_failure_counter(self):
-        """Reset the failure counter once the connection has proven stable."""
-        if (
-            self._connection_start_time
-            and self._consecutive_failures > 0
-            and time.time() - self._connection_start_time >= CONNECTION_ESTABLISHED_THRESHOLD
-        ):
-            self._consecutive_failures = 0
+    async def _report_connection_failure(self, error: Exception):
+        """Report one connection or stream failure as a non-fatal ErrorFrame.
+
+        The original exception rides along on the frame so downstream consumers
+        can tell an invalid key (e.g. websocket close 1008) from a quota error.
+        """
+        if self._stopped:
+            return
+        logger.warning(
+            f"{self}: Gemini connection failed, retrying in {RECONNECT_INTERVAL_SECONDS}s: {error}"
+        )
+        await self._call_event_handler("on_connection_error", str(error))
+        await self.push_error(error_msg=f"Gemini STT connection error: {error}", exception=error)
 
     async def _handle_server_message(self, message: LiveServerMessage):
         sc = message.server_content
