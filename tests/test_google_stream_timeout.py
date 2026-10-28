@@ -166,6 +166,31 @@ async def test_failure_to_close_a_stalled_stream_does_not_hide_the_timeout():
 
 
 @pytest.mark.asyncio
+async def test_function_call_from_a_stalled_stream_is_not_run():
+    """A call collected before the stall ends with the turn rather than running."""
+
+    async def generator():
+        yield GenerateContentResponse(
+            candidates=[
+                Candidate(
+                    content=Content(
+                        role="model",
+                        parts=[Part(function_call=FunctionCall(id="call-1", name="transfer_call"))],
+                    )
+                )
+            ]
+        )
+        await asyncio.Event().wait()
+
+    run_function_calls = AsyncMock()
+    _, errors, events = await _stream(generator, run_function_calls=run_function_calls)
+
+    assert errors == ["LLM completion timeout"]
+    assert events == ["on_completion_timeout"]
+    run_function_calls.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_timeout_raised_by_a_function_call_is_not_a_completion_timeout():
     """Only the stream is bounded by the completion timeout, not the tools it calls."""
 

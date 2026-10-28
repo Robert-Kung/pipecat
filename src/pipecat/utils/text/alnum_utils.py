@@ -24,7 +24,9 @@ def has_alnum(text: str) -> bool:
     the letters inside a tag don't count, so ``"<break/>"`` is empty by this
     measure. Function-tag markup (``<function=...>...</function>``) is removed
     whole, arguments included, the same way XMLFunctionTagFilter removes it
-    before TTS.
+    before TTS. It judges the whole response at once, which approximates the
+    filter: the filter runs on each sentence the TTS aggregates, so a tag split
+    across sentences is matched here but not there.
 
     Args:
         text: A complete text, such as everything an LLM produced in one response.
