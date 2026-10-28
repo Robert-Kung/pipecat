@@ -73,7 +73,9 @@ def _streaming_service(chunks) -> OpenAILLMService:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("content", ["\n", "...", "<break/>"])
+@pytest.mark.parametrize(
+    "content", ["\n", "...", "<break/>", '<function=transfer_call>{"reason":"x"}</function>']
+)
 async def test_unspeakable_content_does_not_defer_function_call(content):
     service = _streaming_service([_content_chunk(content), _tool_call_chunk("transfer_call")])
 
@@ -84,8 +86,9 @@ async def test_unspeakable_content_does_not_defer_function_call(content):
 
 
 @pytest.mark.asyncio
-async def test_speakable_content_defers_function_call():
-    service = _streaming_service([_content_chunk("好的。"), _tool_call_chunk("transfer_call")])
+@pytest.mark.parametrize("content", ["好的。", "請稍候<function=x>{}</function>"])
+async def test_speakable_content_defers_function_call(content):
+    service = _streaming_service([_content_chunk(content), _tool_call_chunk("transfer_call")])
 
     await service._process_context(LLMContext())
 

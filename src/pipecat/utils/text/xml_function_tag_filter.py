@@ -19,6 +19,21 @@ from loguru import logger
 
 from pipecat.utils.text.base_text_filter import BaseTextFilter
 
+FUNCTION_TAG_PATTERNS = (
+    # Self-closing function tags: <function=name/> or <function=name />
+    r"<function=[^/>]*\s*/\s*>",
+    # Standard function tags: <function=...>...</function>
+    r"<function=.*?</function>",
+)
+"""Function-tag markup the filter removes, in the order it removes it.
+
+Shared with ``has_alnum()`` so that what counts as speakable stays in step
+with what this filter lets through to the synthesizer.
+"""
+
+FUNCTION_TAG_FLAGS = re.IGNORECASE | re.DOTALL
+"""Regex flags the function-tag patterns are compiled with."""
+
 
 class XMLFunctionTagFilter(BaseTextFilter):
     """A text filter that removes XML function tag markup from text.
@@ -48,12 +63,7 @@ class XMLFunctionTagFilter(BaseTextFilter):
         """
         self._preserve_whitespace = preserve_whitespace
 
-        self._default_patterns = [
-            # Self-closing function tags: <function=name/> or <function=name />
-            r"<function=[^/>]*\s*/\s*>",
-            # Standard function tags: <function=...>...</function>
-            r"<function=.*?</function>",
-        ]
+        self._default_patterns = list(FUNCTION_TAG_PATTERNS)
 
         # Combine default patterns with custom ones
         all_patterns = self._default_patterns.copy()
@@ -61,7 +71,7 @@ class XMLFunctionTagFilter(BaseTextFilter):
             all_patterns.extend(custom_patterns)
 
         # Compile patterns for performance
-        flags = re.IGNORECASE | re.DOTALL
+        flags = FUNCTION_TAG_FLAGS
         self._compiled_patterns = [re.compile(pattern, flags) for pattern in all_patterns]
 
     async def update_settings(self, settings: Mapping[str, Any]):
@@ -86,7 +96,7 @@ class XMLFunctionTagFilter(BaseTextFilter):
             if custom_patterns:
                 all_patterns.extend(custom_patterns)
 
-            flags = re.IGNORECASE | re.DOTALL
+            flags = FUNCTION_TAG_FLAGS
             self._compiled_patterns = [re.compile(pattern, flags) for pattern in all_patterns]
 
     async def filter(self, text: str) -> str:

@@ -72,7 +72,19 @@ async def _process(chunks) -> GoogleLLMService:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("content", ["\n", " ", "...", "。", "<break/>"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "\n",
+        " ",
+        "...",
+        "。",
+        "<break/>",
+        # XMLFunctionTagFilter removes function-tag markup before TTS, so a
+        # response that is nothing but a tag leaves nothing to speak either.
+        '<function=transfer_call>{"reason":"x"}</function>',
+    ],
+)
 async def test_unspeakable_content_does_not_defer_function_call(content):
     service = await _process([_text_chunk(content), _tool_call_chunk("transfer_call")])
 
@@ -83,7 +95,9 @@ async def test_unspeakable_content_does_not_defer_function_call(content):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("content", ["好的，幫您轉接。", "OK", "5"])
+@pytest.mark.parametrize(
+    "content", ["好的，幫您轉接。", "OK", "5", "請稍候<function=x>{}</function>"]
+)
 async def test_speakable_content_defers_function_call(content):
     service = await _process([_text_chunk(content), _tool_call_chunk("transfer_call")])
 
