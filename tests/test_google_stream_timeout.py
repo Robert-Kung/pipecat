@@ -7,7 +7,7 @@
 """Tests for the streamed-response timeouts and retry in GoogleLLMService."""
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from google import genai
@@ -15,12 +15,14 @@ from google.genai.types import (
     Candidate,
     Content,
     FinishReason,
+    FunctionCall,
     GenerateContentResponse,
     Part,
 )
 
-from pipecat.frames.frames import LLMFullResponseEndFrame, LLMTextFrame
+from pipecat.frames.frames import ErrorFrame, LLMFullResponseEndFrame, LLMTextFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.llm import GoogleLLMService
 
 # Short enough to keep tests quick, long enough to outlast scheduling jitter.
@@ -54,23 +56,24 @@ def _attempts(*generators):
     return factory, attempts
 
 
-async def _stream(generator, timeout=IDLE_TIMEOUT, **service_kwargs):
+async def _stream(generator, timeout=IDLE_TIMEOUT, run_function_calls=None, **service_kwargs):
     """Run a context through the service against a canned stream.
 
     Returns:
-        The pushed frames, any errors pushed upstream, and the names of any
-        service events fired.
+        The pushed frames (error frames pushed upstream included), the messages
+        of those error frames, and the names of any service events fired.
     """
     service = GoogleLLMService(
         api_key="test-key", stream_idle_timeout_secs=timeout, **service_kwargs
     )
+    if run_function_calls is not None:
+        service.run_function_calls = run_function_calls
     frames, errors, events = [], [], []
 
-    async def capture_frame(frame, direction=None):
+    async def capture_frame(frame, direction=FrameDirection.DOWNSTREAM):
         frames.append(frame)
-
-    async def capture_error(error):
-        errors.append(error.error)
+        if direction == FrameDirection.UPSTREAM and isinstance(frame, ErrorFrame):
+            errors.append(frame.error)
 
     @service.event_handler("on_completion_timeout")
     async def on_completion_timeout(_):
@@ -82,7 +85,6 @@ async def _stream(generator, timeout=IDLE_TIMEOUT, **service_kwargs):
     with (
         patch.object(service, "push_frame", capture_frame),
         patch.object(service, "_stream_content", fake_stream),
-        patch.object(service, "push_error_frame", capture_error),
     ):
         await service._process_context(LLMContext())
 
@@ -122,6 +124,99 @@ async def test_stalled_stream_times_out_and_closes_the_response():
     # aggregator downstream isn't left waiting on a turn that will never end.
     assert [f.text for f in frames if isinstance(f, LLMTextFrame)] == ["Starting to answer"]
     assert isinstance(frames[-1], LLMFullResponseEndFrame)
+
+
+@pytest.mark.asyncio
+async def test_stalled_stream_error_is_not_fatal():
+    """A timed-out turn reports a recoverable error so the pipeline keeps the call up.
+
+    Callers rely on the pipeline staying alive after a stall, to speak a fallback
+    or hand the call to a person, so the error must not be one that ends it.
+    """
+
+    async def generator():
+        yield _chunk("Starting to answer")
+        await asyncio.Event().wait()
+
+    frames, _, _ = await _stream(generator)
+
+    [error] = [f for f in frames if isinstance(f, ErrorFrame)]
+    assert error.error == "LLM completion timeout"
+    assert error.fatal is False
+
+
+@pytest.mark.asyncio
+async def test_failure_to_close_a_stalled_stream_does_not_hide_the_timeout():
+    """An error raised while closing the stream is not reported in place of the stall."""
+
+    class UnclosableStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            raise RuntimeError("connection already gone")
+
+    _, errors, events = await _stream(UnclosableStream)
+
+    assert errors == ["LLM completion timeout"]
+    assert events == ["on_completion_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_raised_by_a_function_call_is_not_a_completion_timeout():
+    """Only the stream is bounded by the completion timeout, not the tools it calls."""
+
+    async def generator():
+        yield GenerateContentResponse(
+            candidates=[
+                Candidate(
+                    content=Content(
+                        role="model",
+                        parts=[Part(function_call=FunctionCall(id="call-1", name="lookup"))],
+                    ),
+                    finish_reason=FinishReason.STOP,
+                )
+            ]
+        )
+
+    _, errors, events = await _stream(
+        generator, run_function_calls=AsyncMock(side_effect=TimeoutError())
+    )
+
+    assert events == []
+    assert errors != ["LLM completion timeout"]
+    assert len(errors) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_is_closed_when_handling_a_chunk_fails():
+    """A turn that ends on an error doesn't leave the stream open behind it."""
+    closed = []
+
+    async def generator():
+        try:
+            yield _chunk("Hello")
+            await asyncio.Event().wait()
+        finally:
+            closed.append("stream")
+
+    service = GoogleLLMService(api_key="test-key", stream_idle_timeout_secs=IDLE_TIMEOUT)
+
+    async def fake_stream(context):
+        return generator()
+
+    with (
+        patch.object(service, "push_frame", AsyncMock()),
+        patch.object(service, "_stream_content", fake_stream),
+        patch.object(service, "_push_llm_text", AsyncMock(side_effect=RuntimeError("boom"))),
+    ):
+        await service._process_context(LLMContext())
+        # Checked before yielding to the loop: closing must not wait on the
+        # garbage collector's finalizer.
+        assert closed == ["stream"]
 
 
 @pytest.mark.asyncio

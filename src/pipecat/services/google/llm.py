@@ -575,9 +575,14 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             # that's because it stalled, was interrupted, or is being re-issued.
             # Closing is best-effort: the client's stream type only promises
             # AsyncIterator, which has no aclose().
+            # A failure to close must not replace the error that got us here,
+            # such as the TimeoutError of a stall.
             aclose = getattr(response, "aclose", None)
             if aclose is not None:
-                await aclose()
+                try:
+                    await aclose()
+                except Exception as e:
+                    logger.debug(f"{self}: error closing the response stream: {e!r}")
 
     @traced_llm
     async def _process_context(self, context: LLMContext):
@@ -604,168 +609,184 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             await self.start_ttfb_metrics()
 
             function_calls = []
-            async for chunk in self._stream_response(context):
-                # Stop TTFB metrics after the first chunk
-                await self.stop_ttfb_metrics()
-                # Gemini may send usage_metadata in multiple chunks with varying behavior:
-                # - Sometimes a single chunk, sometimes multiple chunks
-                # - Token counts may be cumulative (growing) or may change between chunks
-                # - Early chunks may include estimates/overhead that gets refined
-                # We use assignment (not accumulation) because the final chunk always contains
-                # the authoritative, billable token usage for the entire response.
-                if chunk.usage_metadata:
-                    prompt_tokens = chunk.usage_metadata.prompt_token_count or 0
-                    completion_tokens = chunk.usage_metadata.candidates_token_count or 0
-                    total_tokens = chunk.usage_metadata.total_token_count or 0
-                    cache_read_input_tokens = chunk.usage_metadata.cached_content_token_count or 0
-                    reasoning_tokens = chunk.usage_metadata.thoughts_token_count or 0
-
-                if not chunk.candidates:
-                    continue
-
-                for candidate in chunk.candidates:
-                    if candidate.finish_reason:
-                        finish_reason = (
-                            candidate.finish_reason.value
-                            if hasattr(candidate.finish_reason, "value")
-                            else candidate.finish_reason
-                        )
-                        finish_message = (
-                            f" finish_message={candidate.finish_message!r}"
-                            if candidate.finish_message
-                            else ""
-                        )
-                        logger.debug(
-                            f"{self}: Google generation stopped with "
-                            f"finish_reason={finish_reason}{finish_message}"
-                        )
-
-                    if candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            function_call_id = None
-                            if part.text:
-                                if part.thought:
-                                    # Gemini emits fully-formed thoughts rather
-                                    # than chunks so bracket each thought in
-                                    # start/end
-                                    await self.push_frame(LLMThoughtStartFrame())
-                                    await self.push_frame(LLMThoughtTextFrame(part.text))
-                                    await self.push_frame(LLMThoughtEndFrame())
-                                else:
-                                    accumulated_text += part.text
-                                    await self._push_llm_text(part.text)
-                            elif part.function_call:
-                                function_call = part.function_call
-                                function_call_id = function_call.id or str(uuid.uuid4())
-                                logger.debug(
-                                    f"Function call: {function_call.name}:{function_call_id}"
-                                )
-                                function_calls.append(
-                                    FunctionCallFromLLM(
-                                        context=context,
-                                        tool_call_id=function_call_id,
-                                        function_name=function_call.name,
-                                        arguments=function_call.args or {},
-                                    )
-                                )
-                            elif part.inline_data and part.inline_data.data:
-                                # Here we assume that inline_data is an image.
-                                image = Image.open(io.BytesIO(part.inline_data.data))
-                                await self.push_frame(
-                                    AssistantImageRawFrame(
-                                        image=image.tobytes(),
-                                        size=image.size,
-                                        format="RGB",
-                                        original_data=part.inline_data.data,
-                                        original_mime_type=part.inline_data.mime_type,
-                                    )
-                                )
-
-                            # Handle Gemini thought signatures.
-                            #
-                            # - Gemini 2.5: they appear on function_call Parts,
-                            # and then (surprisingly) on the last(*) Part of
-                            # model responses following the first function_call
-                            # in a conversation.
-                            # - Gemini 3 Pro: they appear on the last(*) Part
-                            # of model responses, regardless of Part type.
-                            #
-                            # (*) Since we're using the streaming API, though,
-                            # where text Parts may be split across multiple
-                            # chunks (each represented by a Part, confusingly),
-                            # signatures may actually appear with the first
-                            # chunk (Gemini 2.5) or in a trailing empty-text
-                            # chunk (Gemini 3 Pro).
-                            if part.thought_signature:
-                                # Save a "bookmark" for the signature, so we
-                                # can later be sure we've put it in the right
-                                # place in context when sending the context
-                                # back to the LLM to continue the conversation.
-                                bookmark = {}
-                                if part.function_call:
-                                    bookmark["function_call"] = function_call_id
-                                elif part.inline_data and part.inline_data.data:
-                                    bookmark["inline_data"] = part.inline_data
-                                elif part.text is not None:
-                                    # Account for Gemini 3 Pro trailing
-                                    # empty-text chunk by using all the text
-                                    # seen so far in this response's chunks.
-                                    bookmark["text"] = accumulated_text
-                                else:
-                                    logger.warning("Thought signature found on unhandled Part type")
-                                if bookmark:
-                                    await self.push_frame(
-                                        LLMMessagesAppendFrame(
-                                            [
-                                                self.get_llm_adapter().create_llm_specific_message(
-                                                    {
-                                                        "type": "thought_signature",
-                                                        "signature": part.thought_signature,
-                                                        "bookmark": bookmark,
-                                                    }
-                                                )
-                                            ]
-                                        )
-                                    )
-
-                    if (
-                        candidate.grounding_metadata
-                        and candidate.grounding_metadata.grounding_chunks
-                    ):
-                        m = candidate.grounding_metadata
-                        rendered_content = (
-                            m.search_entry_point.rendered_content if m.search_entry_point else None
-                        )
-                        origins = [
-                            {
-                                "site_uri": grounding_chunk.web.uri
-                                if grounding_chunk.web
-                                else None,
-                                "site_title": grounding_chunk.web.title
-                                if grounding_chunk.web
-                                else None,
-                                "results": [
-                                    {
-                                        "text": grounding_support.segment.text
-                                        if grounding_support.segment
-                                        else "",
-                                        "confidence": grounding_support.confidence_scores,
-                                    }
-                                    for grounding_support in (
-                                        m.grounding_supports if m.grounding_supports else []
-                                    )
-                                    if grounding_support.grounding_chunk_indices
-                                    and index in grounding_support.grounding_chunk_indices
-                                ],
-                            }
-                            for index, grounding_chunk in enumerate(
-                                m.grounding_chunks if m.grounding_chunks else []
+            # Only the stream is bounded by the completion timeout: a TimeoutError
+            # raised while running the function calls below is not a stalled stream.
+            try:
+                async with aclosing(self._stream_response(context)) as stream:
+                    async for chunk in stream:
+                        # Stop TTFB metrics after the first chunk
+                        await self.stop_ttfb_metrics()
+                        # Gemini may send usage_metadata in multiple chunks with varying behavior:
+                        # - Sometimes a single chunk, sometimes multiple chunks
+                        # - Token counts may be cumulative (growing) or may change between chunks
+                        # - Early chunks may include estimates/overhead that gets refined
+                        # We use assignment (not accumulation) because the final chunk always contains
+                        # the authoritative, billable token usage for the entire response.
+                        if chunk.usage_metadata:
+                            prompt_tokens = chunk.usage_metadata.prompt_token_count or 0
+                            completion_tokens = chunk.usage_metadata.candidates_token_count or 0
+                            total_tokens = chunk.usage_metadata.total_token_count or 0
+                            cache_read_input_tokens = (
+                                chunk.usage_metadata.cached_content_token_count or 0
                             )
-                        ]
-                        grounding_metadata = {
-                            "rendered_content": rendered_content,
-                            "origins": origins,
-                        }
+                            reasoning_tokens = chunk.usage_metadata.thoughts_token_count or 0
+
+                        if not chunk.candidates:
+                            continue
+
+                        for candidate in chunk.candidates:
+                            if candidate.finish_reason:
+                                finish_reason = (
+                                    candidate.finish_reason.value
+                                    if hasattr(candidate.finish_reason, "value")
+                                    else candidate.finish_reason
+                                )
+                                finish_message = (
+                                    f" finish_message={candidate.finish_message!r}"
+                                    if candidate.finish_message
+                                    else ""
+                                )
+                                logger.debug(
+                                    f"{self}: Google generation stopped with "
+                                    f"finish_reason={finish_reason}{finish_message}"
+                                )
+
+                            if candidate.content and candidate.content.parts:
+                                for part in candidate.content.parts:
+                                    function_call_id = None
+                                    if part.text:
+                                        if part.thought:
+                                            # Gemini emits fully-formed thoughts rather
+                                            # than chunks so bracket each thought in
+                                            # start/end
+                                            await self.push_frame(LLMThoughtStartFrame())
+                                            await self.push_frame(LLMThoughtTextFrame(part.text))
+                                            await self.push_frame(LLMThoughtEndFrame())
+                                        else:
+                                            accumulated_text += part.text
+                                            await self._push_llm_text(part.text)
+                                    elif part.function_call:
+                                        function_call = part.function_call
+                                        function_call_id = function_call.id or str(uuid.uuid4())
+                                        logger.debug(
+                                            f"Function call: {function_call.name}:{function_call_id}"
+                                        )
+                                        function_calls.append(
+                                            FunctionCallFromLLM(
+                                                context=context,
+                                                tool_call_id=function_call_id,
+                                                function_name=function_call.name,
+                                                arguments=function_call.args or {},
+                                            )
+                                        )
+                                    elif part.inline_data and part.inline_data.data:
+                                        # Here we assume that inline_data is an image.
+                                        image = Image.open(io.BytesIO(part.inline_data.data))
+                                        await self.push_frame(
+                                            AssistantImageRawFrame(
+                                                image=image.tobytes(),
+                                                size=image.size,
+                                                format="RGB",
+                                                original_data=part.inline_data.data,
+                                                original_mime_type=part.inline_data.mime_type,
+                                            )
+                                        )
+
+                                    # Handle Gemini thought signatures.
+                                    #
+                                    # - Gemini 2.5: they appear on function_call Parts,
+                                    # and then (surprisingly) on the last(*) Part of
+                                    # model responses following the first function_call
+                                    # in a conversation.
+                                    # - Gemini 3 Pro: they appear on the last(*) Part
+                                    # of model responses, regardless of Part type.
+                                    #
+                                    # (*) Since we're using the streaming API, though,
+                                    # where text Parts may be split across multiple
+                                    # chunks (each represented by a Part, confusingly),
+                                    # signatures may actually appear with the first
+                                    # chunk (Gemini 2.5) or in a trailing empty-text
+                                    # chunk (Gemini 3 Pro).
+                                    if part.thought_signature:
+                                        # Save a "bookmark" for the signature, so we
+                                        # can later be sure we've put it in the right
+                                        # place in context when sending the context
+                                        # back to the LLM to continue the conversation.
+                                        bookmark = {}
+                                        if part.function_call:
+                                            bookmark["function_call"] = function_call_id
+                                        elif part.inline_data and part.inline_data.data:
+                                            bookmark["inline_data"] = part.inline_data
+                                        elif part.text is not None:
+                                            # Account for Gemini 3 Pro trailing
+                                            # empty-text chunk by using all the text
+                                            # seen so far in this response's chunks.
+                                            bookmark["text"] = accumulated_text
+                                        else:
+                                            logger.warning(
+                                                "Thought signature found on unhandled Part type"
+                                            )
+                                        if bookmark:
+                                            await self.push_frame(
+                                                LLMMessagesAppendFrame(
+                                                    [
+                                                        self.get_llm_adapter().create_llm_specific_message(
+                                                            {
+                                                                "type": "thought_signature",
+                                                                "signature": part.thought_signature,
+                                                                "bookmark": bookmark,
+                                                            }
+                                                        )
+                                                    ]
+                                                )
+                                            )
+
+                            if (
+                                candidate.grounding_metadata
+                                and candidate.grounding_metadata.grounding_chunks
+                            ):
+                                m = candidate.grounding_metadata
+                                rendered_content = (
+                                    m.search_entry_point.rendered_content
+                                    if m.search_entry_point
+                                    else None
+                                )
+                                origins = [
+                                    {
+                                        "site_uri": grounding_chunk.web.uri
+                                        if grounding_chunk.web
+                                        else None,
+                                        "site_title": grounding_chunk.web.title
+                                        if grounding_chunk.web
+                                        else None,
+                                        "results": [
+                                            {
+                                                "text": grounding_support.segment.text
+                                                if grounding_support.segment
+                                                else "",
+                                                "confidence": grounding_support.confidence_scores,
+                                            }
+                                            for grounding_support in (
+                                                m.grounding_supports if m.grounding_supports else []
+                                            )
+                                            if grounding_support.grounding_chunk_indices
+                                            and index in grounding_support.grounding_chunk_indices
+                                        ],
+                                    }
+                                    for index, grounding_chunk in enumerate(
+                                        m.grounding_chunks if m.grounding_chunks else []
+                                    )
+                                ]
+                                grounding_metadata = {
+                                    "rendered_content": rendered_content,
+                                    "origins": origins,
+                                }
+            except (TimeoutError, DeadlineExceeded) as e:
+                await self._call_event_handler("on_completion_timeout")
+                await self.push_error(error_msg="LLM completion timeout", exception=e)
+                # The turn ends here: calls collected from a stalled response are
+                # not run.
+                return
 
             # Handle function calls if any were collected
             if function_calls:
@@ -793,9 +814,6 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 else:
                     logger.debug(f"{self}: Executing {len(function_calls)} function calls")
                     await self.run_function_calls(function_calls)
-        except (TimeoutError, DeadlineExceeded) as e:
-            await self._call_event_handler("on_completion_timeout")
-            await self.push_error(error_msg="LLM completion timeout", exception=e)
         except Exception as e:
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
