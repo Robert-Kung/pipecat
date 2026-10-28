@@ -43,6 +43,7 @@ from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.settings import NOT_GIVEN as _NOT_GIVEN
 from pipecat.services.settings import LLMSettings, _NotGiven, assert_given
 from pipecat.utils.deprecation import deprecated
+from pipecat.utils.text.alnum_utils import has_alnum
 from pipecat.utils.tracing.service_decorators import traced_llm
 
 
@@ -424,10 +425,16 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         tool_call_id = ""
 
         # Reset pending function calls when processing a new context
+        if self._pending_function_calls:
+            logger.warning(
+                f"{self}: discarding {len(self._pending_function_calls)} "
+                "deferred calls never released by TTS"
+            )
         self._pending_function_calls = []
 
-        # Flag to store whether some text was generated in the current generation
-        text_generated_signal = False
+        # Content generated in the current completion, accumulated so the
+        # deferral decision below can ask whether any of it is speakable.
+        generated_content = ""
 
         await self.start_ttfb_metrics()
 
@@ -516,7 +523,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                         # Keep iterating through the response to collect all the argument fragments
                         arguments += tool_call.function.arguments
                 elif chunk.choices[0].delta.content:
-                    text_generated_signal = True
+                    generated_content += chunk.choices[0].delta.content
                     await self._push_llm_text(chunk.choices[0].delta.content)
 
                 # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
@@ -563,9 +570,17 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 direction=FrameDirection.DOWNSTREAM,
             )
 
-            # If text was generated, defer function calls until after TTS plays
-            # Otherwise, execute them immediately
-            if text_generated_signal:
+            # Defer function calls until after TTS only for speakable text.
+            # Unspeakable content (whitespace, punctuation, markup) never
+            # produces the BotStoppedSpeakingFrame that releases the
+            # deferral, so it must not count as generated text.
+            text_generated = has_alnum(generated_content)
+            if generated_content and not text_generated:
+                logger.info(
+                    f"{self}: no speakable content in {len(generated_content)} chars of text; "
+                    "running function calls without waiting for TTS"
+                )
+            if text_generated:
                 self._pending_function_calls = function_calls
                 logger.debug(
                     f"{self}: Deferring {len(function_calls)} function calls until after TTS"
