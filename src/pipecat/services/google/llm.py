@@ -10,10 +10,12 @@ This module provides Google Gemini integration for the Pipecat framework,
 including LLM services, context management, and message aggregation.
 """
 
+import asyncio
 import io
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, Union
 
@@ -191,6 +193,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         tools: list[dict[str, Any]] | None = None,
         tool_config: dict[str, Any] | None = None,
         http_options: HttpOptions | None = None,
+        stream_idle_timeout_secs: float | None = 20.0,
+        retry_timeout_secs: float | None = 5.0,
+        retry_on_timeout: bool | None = False,
         **kwargs,
     ):
         """Initialize the Google LLM service.
@@ -221,6 +226,23 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             tools: List of available tools/functions.
             tool_config: Configuration for tool usage.
             http_options: HTTP options for the client.
+            stream_idle_timeout_secs: How long to wait for the next chunk of a streamed
+                response before giving up on it. Bounds the wait when the API accepts a
+                request and then stops producing without closing the stream. This is a
+                gap between chunks, not a limit on how long a response may take overall.
+                The first chunk is the slowest, since its wait spans the whole round trip
+                including any thinking the model does before it emits anything; raise this
+                for models configured to think at length. Set to ``None`` to wait
+                indefinitely.
+            retry_timeout_secs: How long to wait for the first chunk before giving up
+                on the request and re-issuing it, when ``retry_on_timeout`` is set.
+                Like the first-chunk wait above, this window spans the whole round
+                trip including any thinking, so it is only a good fit for models that
+                start emitting quickly.
+            retry_on_timeout: Whether to re-issue the request once if the first chunk
+                doesn't arrive within ``retry_timeout_secs``. Only the first chunk is
+                retried: once a chunk has been pushed downstream, re-issuing would
+                duplicate the response.
             **kwargs: Additional arguments passed to parent class.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -270,6 +292,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         self._http_options = update_google_client_http_options(http_options)
         self._tools = tools
         self._tool_config = tool_config
+        self._stream_idle_timeout_secs = stream_idle_timeout_secs
+        self._retry_timeout_secs = retry_timeout_secs
+        self._retry_on_timeout = retry_on_timeout
 
         # Store pending function calls that need to be executed after TTS
         self._pending_function_calls = []
@@ -454,12 +479,105 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
         generation_config = GenerateContentConfig(**generation_params)
 
-        await self.start_ttfb_metrics()
         return await self._client.aio.models.generate_content_stream(
             model=self._settings.model,
             contents=messages,
             config=generation_config,
         )
+
+    async def _stream_response(
+        self, context: LLMContext
+    ) -> AsyncGenerator[GenerateContentResponse, None]:
+        """Yield the model's streamed chunks, re-issuing the request once if it stalls.
+
+        The API client sends the request lazily, when the first chunk is pulled, so a
+        request that is accepted and then produces nothing shows up as a first chunk
+        that never arrives. Re-issuing is safe only up to that point: once a chunk has
+        been yielded, its content is already on its way downstream.
+
+        Args:
+            context: The context to generate a response for.
+
+        Yields:
+            Each chunk of the streamed response.
+
+        Raises:
+            TimeoutError: If the stream stalls past the timeout it is bounded by.
+        """
+        if self._retry_on_timeout:
+            async with aclosing(
+                self._iter_stream(
+                    await self._stream_content(context),
+                    first_chunk_timeout=self._retry_timeout_secs,
+                )
+            ) as stream:
+                try:
+                    first_chunk = await stream.__anext__()
+                except StopAsyncIteration:
+                    return
+                except (TimeoutError, DeadlineExceeded):
+                    logger.debug(f"{self}: retrying content generation due to timeout")
+                else:
+                    yield first_chunk
+                    async for chunk in stream:
+                        yield chunk
+                    return
+
+        # Either retries are disabled, or the initial attempt timed out.
+        async with aclosing(
+            self._iter_stream(
+                await self._stream_content(context),
+                first_chunk_timeout=self._stream_idle_timeout_secs,
+            )
+        ) as stream:
+            async for chunk in stream:
+                yield chunk
+
+    async def _iter_stream(
+        self,
+        response: AsyncIterator[GenerateContentResponse],
+        *,
+        first_chunk_timeout: float | None,
+    ) -> AsyncGenerator[GenerateContentResponse, None]:
+        """Yield streamed chunks, giving up if the stream stalls between them.
+
+        A stream that stops producing without closing would otherwise leave the
+        response open indefinitely, since the API client applies no timeout of its
+        own. The timeout covers the gap between chunks rather than the response as
+        a whole, so a slow but healthy stream is never cut short.
+
+        Args:
+            response: The streamed response to consume.
+            first_chunk_timeout: How long to wait for the first chunk. Every later
+                chunk is bounded by ``stream_idle_timeout_secs``.
+
+        Yields:
+            Each chunk of the streamed response.
+
+        Raises:
+            TimeoutError: If the next chunk doesn't arrive in time.
+        """
+        chunks = response.__aiter__()
+        timeout = first_chunk_timeout
+        try:
+            while True:
+                try:
+                    if timeout is None:
+                        chunk = await chunks.__anext__()
+                    else:
+                        chunk = await asyncio.wait_for(chunks.__anext__(), timeout=timeout)
+                except StopAsyncIteration:
+                    return
+                yield chunk
+                timeout = self._stream_idle_timeout_secs
+        finally:
+            # Release the HTTP resources held by a stream we walk away from, whether
+            # that's because it stalled, was interrupted, or is being re-issued.
+            # Closing is best-effort: the client's stream type only promises
+            # AsyncIterator, which has no aclose().
+            aclose = getattr(response, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     @traced_llm
     async def _process_context(self, context: LLMContext):
@@ -483,11 +601,10 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         self._pending_function_calls = []
 
         try:
-            # Generate content from LLMContext
-            response = await self._stream_content(context)
+            await self.start_ttfb_metrics()
 
             function_calls = []
-            async for chunk in response:
+            async for chunk in self._stream_response(context):
                 # Stop TTFB metrics after the first chunk
                 await self.stop_ttfb_metrics()
                 # Gemini may send usage_metadata in multiple chunks with varying behavior:
@@ -676,8 +793,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 else:
                     logger.debug(f"{self}: Executing {len(function_calls)} function calls")
                     await self.run_function_calls(function_calls)
-        except DeadlineExceeded:
+        except (TimeoutError, DeadlineExceeded) as e:
             await self._call_event_handler("on_completion_timeout")
+            await self.push_error(error_msg="LLM completion timeout", exception=e)
         except Exception as e:
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
