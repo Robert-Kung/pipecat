@@ -577,7 +577,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             text_generated = has_alnum(generated_content)
             if generated_content and not text_generated:
                 logger.info(
-                    f"{self}: no speakable content ({generated_content[:120]!r}); "
+                    f"{self}: no speakable content in {len(generated_content)} chars of text; "
                     "running function calls without waiting for TTS"
                 )
             if text_generated:

@@ -782,7 +782,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 text_generated = has_alnum(accumulated_text)
                 if accumulated_text and not text_generated:
                     logger.info(
-                        f"{self}: no speakable content ({accumulated_text[:120]!r}); "
+                        f"{self}: no speakable content in {len(accumulated_text)} chars of text; "
                         "running function calls without waiting for TTS"
                     )
                 if text_generated:
