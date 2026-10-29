@@ -1735,11 +1735,18 @@ class GeminiTTSService(GoogleBaseTTSService):
                 # TTS is unusable instead of only noticing silence.
                 raise GeminiTTSNoAudioError(finish_reason=finish_reason, block_reason=block_reason)
 
+        except GeminiTTSStreamTimeoutError as e:
+            # Pushed upstream directly, not yielded: a yielded frame goes through
+            # the audio context, whose idle timer (stop_frame_timeout_s) restarts
+            # on the same chunk as the stall timer. When both expire together the
+            # context is closed with the ErrorFrame still in its queue and the
+            # error is dropped, leaving a skipped utterance nobody hears of.
+            # Non-fatal, like every other TTS error here.
+            await self.push_error(f"Gemini GenAI TTS generation error: {str(e)}", exception=e)
         except Exception as e:
             # Non-fatal, with the original exception attached (e.g. a
             # google.genai ClientError with code 400/403 for an invalid key, 429
-            # for an exhausted quota, GeminiTTSStreamTimeoutError for a stall) so
-            # the application can tell why TTS failed.
+            # for an exhausted quota) so the application can tell why TTS failed.
             yield ErrorFrame(error=f"Gemini GenAI TTS generation error: {str(e)}", exception=e)
 
     async def _iter_genai_stream(
@@ -1771,8 +1778,13 @@ class GeminiTTSService(GoogleBaseTTSService):
                         chunk = await chunks.__anext__()
                     else:
                         try:
-                            chunk = await asyncio.wait_for(chunks.__anext__(), timeout=timeout)
+                            async with asyncio.timeout(timeout) as deadline:
+                                chunk = await chunks.__anext__()
                         except TimeoutError as e:
+                            # A TimeoutError of the stream's own (e.g. an HTTP
+                            # read timeout) is not a stall: report it as itself.
+                            if not deadline.expired():
+                                raise
                             # Only the length of the text is logged: it is call content.
                             logger.warning(
                                 f"{self}: Gemini TTS stream stalled for {timeout}s "

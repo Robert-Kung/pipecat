@@ -25,9 +25,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    ErrorFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    TextFrame,
+    TTSAudioRawFrame,
+    TTSSpeakFrame,
+)
 from pipecat.services.google.tts import GeminiTTSService, GeminiTTSStreamTimeoutError
-from pipecat.tests.utils import run_test
+from pipecat.tests.utils import SleepFrame, run_test
 
 # Fixed fake key (design D8 scan rule: the 1.1/1.8 unit-test value).
 FAKE_KEY = "AIza" + "0" * 35
@@ -71,8 +78,10 @@ def audio_chunk(data=ONE_SECOND, finish_reason=None):
     )
 
 
-async def run_tts(mock_client_class, generator, **service_kwargs):
+async def run_tts(mock_client_class, generator, frames=None, **service_kwargs):
     """Speak one sentence against a canned stream.
+
+    ``frames`` replaces the default single ``TTSSpeakFrame``.
 
     Returns:
         The audio frames pushed downstream and the error frames pushed upstream.
@@ -90,7 +99,8 @@ async def run_tts(mock_client_class, generator, **service_kwargs):
         **service_kwargs,
     )
     down, up = await asyncio.wait_for(
-        run_test(tts, frames_to_send=[TTSSpeakFrame(text=SPOKEN_TEXT)]), timeout=RUN_TIMEOUT
+        run_test(tts, frames_to_send=frames or [TTSSpeakFrame(text=SPOKEN_TEXT)]),
+        timeout=RUN_TIMEOUT,
     )
     audio = [f for f in down if isinstance(f, TTSAudioRawFrame)]
     errors = [f for f in up if isinstance(f, ErrorFrame)]
@@ -129,6 +139,71 @@ async def test_stalled_stream_times_out_with_a_non_fatal_error(
     # The stream was closed when the timeout fired, not when it ended on its own.
     [stalled] = stalled_for
     assert stalled < STALL / 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunks_before_stall", [0, 1], ids=["before-audio", "mid-utterance"])
+@pytest.mark.parametrize("path", ["speak", "llm-turn"])
+@patch("google.genai.Client")
+async def test_stall_error_is_delivered_when_it_matches_the_stop_frame_timeout(
+    mock_client_class, path, chunks_before_stall
+):
+    """A stall timeout equal to ``stop_frame_timeout_s`` still reaches upstream.
+
+    The audio context's idle timer (``stop_frame_timeout_s``) and the stall
+    timer restart on the same chunk, so with equal values both expire in the
+    same instant. An ErrorFrame queued in the audio context then was dropped
+    with the context as it closed (5.1 fix review R1): the utterance was
+    skipped in silence and nothing upstream heard of it. The stall error now
+    goes upstream directly.
+    """
+
+    async def generator():
+        for _ in range(chunks_before_stall):
+            yield audio_chunk()
+        await asyncio.sleep(STALL)
+
+    keep_running = SleepFrame(IDLE_TIMEOUT * 4)
+    if path == "speak":
+        frames = [TTSSpeakFrame(text=SPOKEN_TEXT), keep_running]
+    else:
+        frames = [
+            LLMFullResponseStartFrame(),
+            TextFrame(text=SPOKEN_TEXT),
+            LLMFullResponseEndFrame(),
+            keep_running,
+        ]
+
+    _, errors = await run_tts(
+        mock_client_class,
+        generator,
+        frames=frames,
+        stream_idle_timeout_secs=IDLE_TIMEOUT,
+        stop_frame_timeout_s=IDLE_TIMEOUT,
+    )
+
+    assert [type(e.exception) for e in errors] == [GeminiTTSStreamTimeoutError]
+    assert errors[0].fatal is False
+
+
+@pytest.mark.asyncio
+@patch("google.genai.Client")
+async def test_stream_own_timeout_is_not_reported_as_a_stall(mock_client_class):
+    """A TimeoutError raised by the stream itself (e.g. an HTTP read timeout)
+    is reported as itself, not as a stall of ``stream_idle_timeout_secs``."""
+
+    class ReadTimeout(TimeoutError):
+        pass
+
+    async def generator():
+        yield audio_chunk()
+        raise ReadTimeout("socket read timed out")
+
+    _, errors = await run_tts(mock_client_class, generator, stream_idle_timeout_secs=STALL)
+
+    assert len(errors) == 1
+    assert type(errors[0].exception) is ReadTimeout
+    assert errors[0].fatal is False
 
 
 @pytest.mark.asyncio
