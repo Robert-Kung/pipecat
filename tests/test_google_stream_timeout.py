@@ -279,6 +279,63 @@ async def test_timeout_can_be_disabled():
 
 
 @pytest.mark.asyncio
+async def test_first_chunk_timeout_can_be_shorter_than_the_idle_timeout():
+    """A first chunk later than ``first_chunk_timeout_secs`` ends the turn, even
+    though the idle timeout between chunks would still be waiting."""
+
+    async def generator():
+        await asyncio.sleep(IDLE_TIMEOUT)
+        yield _chunk("Too late.")
+        yield _chunk(finish_reason=FinishReason.STOP)
+
+    frames, errors, events = await _stream(
+        generator, timeout=IDLE_TIMEOUT * 10, first_chunk_timeout_secs=RETRY_TIMEOUT
+    )
+
+    assert not any(isinstance(f, LLMTextFrame) for f in frames)
+    assert errors == ["LLM completion timeout"]
+    assert events == ["on_completion_timeout"]
+    assert isinstance(frames[-1], LLMFullResponseEndFrame)
+
+
+@pytest.mark.asyncio
+async def test_later_chunks_keep_the_idle_timeout_when_the_first_chunk_timeout_is_set():
+    """Only the first chunk is bounded by ``first_chunk_timeout_secs``; the gaps
+    after it keep ``stream_idle_timeout_secs``."""
+
+    async def generator():
+        yield _chunk("First ")
+        for i in range(3):
+            # Longer than the first-chunk timeout, shorter than the idle timeout.
+            await asyncio.sleep(RETRY_TIMEOUT * 2)
+            yield _chunk(f"chunk{i} ")
+        yield _chunk(finish_reason=FinishReason.STOP)
+
+    frames, errors, events = await _stream(
+        generator, timeout=IDLE_TIMEOUT, first_chunk_timeout_secs=RETRY_TIMEOUT
+    )
+
+    assert len([f for f in frames if isinstance(f, LLMTextFrame)]) == 4
+    assert errors == []
+    assert events == []
+
+
+def test_first_chunk_timeout_follows_the_idle_timeout_unless_set():
+    """Without ``first_chunk_timeout_secs`` the first chunk keeps the idle
+    timeout, as before the option existed; ``None`` lifts the first-chunk bound."""
+    assert GoogleLLMService(api_key="test-key")._first_chunk_timeout_secs == 20.0
+    assert (
+        GoogleLLMService(api_key="test-key", stream_idle_timeout_secs=7.0)._first_chunk_timeout_secs
+        == 7.0
+    )
+    service = GoogleLLMService(
+        api_key="test-key", stream_idle_timeout_secs=7.0, first_chunk_timeout_secs=None
+    )
+    assert service._first_chunk_timeout_secs is None
+    assert service._stream_idle_timeout_secs == 7.0
+
+
+@pytest.mark.asyncio
 async def test_stalled_first_chunk_is_not_retried_by_default():
     """Re-issuing a request is opt-in, since the wait covers the model's thinking."""
 
