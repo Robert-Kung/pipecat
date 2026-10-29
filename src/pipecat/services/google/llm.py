@@ -194,6 +194,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         tool_config: dict[str, Any] | None = None,
         http_options: HttpOptions | None = None,
         stream_idle_timeout_secs: float | None = 20.0,
+        first_chunk_timeout_secs: float | None | _NotGiven = NOT_GIVEN,
         retry_timeout_secs: float | None = 5.0,
         retry_on_timeout: bool | None = False,
         **kwargs,
@@ -232,7 +233,15 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 gap between chunks, not a limit on how long a response may take overall.
                 The first chunk is the slowest, since its wait spans the whole round trip
                 including any thinking the model does before it emits anything; raise this
-                for models configured to think at length. Set to ``None`` to wait
+                for models configured to think at length, or bound the first chunk on its
+                own with ``first_chunk_timeout_secs``. Set to ``None`` to wait
+                indefinitely.
+            first_chunk_timeout_secs: How long to wait for the first chunk, when it
+                should differ from ``stream_idle_timeout_secs`` (e.g. a caller with a
+                budget for how long the model may take to start answering). Every later
+                chunk keeps ``stream_idle_timeout_secs``. When ``retry_on_timeout`` is
+                set, this bounds the re-issued request's first chunk. Defaults to
+                ``stream_idle_timeout_secs``; ``None`` waits for the first chunk
                 indefinitely.
             retry_timeout_secs: How long to wait for the first chunk before giving up
                 on the request and re-issuing it, when ``retry_on_timeout`` is set.
@@ -293,6 +302,11 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         self._tools = tools
         self._tool_config = tool_config
         self._stream_idle_timeout_secs = stream_idle_timeout_secs
+        self._first_chunk_timeout_secs = (
+            first_chunk_timeout_secs
+            if is_given(first_chunk_timeout_secs)
+            else stream_idle_timeout_secs
+        )
         self._retry_timeout_secs = retry_timeout_secs
         self._retry_on_timeout = retry_on_timeout
 
@@ -527,7 +541,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         async with aclosing(
             self._iter_stream(
                 await self._stream_content(context),
-                first_chunk_timeout=self._stream_idle_timeout_secs,
+                first_chunk_timeout=self._first_chunk_timeout_secs,
             )
         ) as stream:
             async for chunk in stream:
