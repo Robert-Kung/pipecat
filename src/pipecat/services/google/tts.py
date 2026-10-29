@@ -14,6 +14,7 @@ It also includes GeminiTTSService which uses Gemini's TTS-specific models
 for natural voice control and multi-speaker conversations.
 """
 
+import asyncio
 import json
 import os
 
@@ -22,7 +23,8 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 # Suppress gRPC fork warnings
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -572,6 +574,34 @@ class GeminiTTSNoAudioError(Exception):
         super().__init__(
             "Gemini TTS response contained no audio "
             f"(finish_reason={finish_reason}, block_reason={block_reason})"
+        )
+
+
+class GeminiTTSStreamTimeoutError(TimeoutError):
+    """A Gemini TTS stream that stopped producing chunks without closing.
+
+    Carries the length of the text being synthesized, never the text itself.
+
+    Parameters:
+        timeout_secs: How long the stream was given for its next chunk.
+        text_length: The length of the text being synthesized.
+        chunks_received: How many chunks arrived before the stream stalled.
+    """
+
+    def __init__(self, timeout_secs: float, text_length: int, chunks_received: int):
+        """Initialize the error.
+
+        Args:
+            timeout_secs: How long the stream was given for its next chunk.
+            text_length: The length of the text being synthesized.
+            chunks_received: How many chunks arrived before the stream stalled.
+        """
+        self.timeout_secs = timeout_secs
+        self.text_length = text_length
+        self.chunks_received = chunks_received
+        super().__init__(
+            f"Gemini TTS stream produced no chunk within {timeout_secs}s "
+            f"(text length {text_length}, chunks received {chunks_received})"
         )
 
 
@@ -1322,6 +1352,7 @@ class GeminiTTSService(GoogleBaseTTSService):
         settings: Settings | None = None,
         use_genai: bool | None = None,
         http_options: HttpOptions | None = None,
+        stream_idle_timeout_secs: float | None = None,
         **kwargs,
     ):
         """Initializes the Gemini TTS service.
@@ -1357,6 +1388,14 @@ class GeminiTTSService(GoogleBaseTTSService):
                 ``GOOGLE_API_KEY`` environment variable is not consulted.
             use_genai: Force use of the google-genai client if True.
             http_options: HTTP client options for the google-genai client.
+            stream_idle_timeout_secs: GenAI backend only. How long to wait for each
+                chunk of the streamed response, the first included, before giving up
+                on the utterance with a non-fatal ``ErrorFrame``. The API client
+                applies no timeout of its own, so without this a request that is
+                accepted and then produces nothing holds the utterance open
+                indefinitely. This bounds the gap between chunks, not the utterance
+                as a whole; the first chunk's wait spans the whole round trip. Defaults
+                to ``None``, which waits indefinitely.
             **kwargs: Additional arguments passed to parent TTSService.
         """
         # Backend selection: an explicit ``use_genai`` wins; otherwise passing an
@@ -1378,6 +1417,7 @@ class GeminiTTSService(GoogleBaseTTSService):
             )
         self._api_key = api_key if self._use_genai else None
         self._http_options = http_options
+        self._stream_idle_timeout_secs = stream_idle_timeout_secs
 
         if sample_rate and sample_rate != self.GOOGLE_SAMPLE_RATE:
             logger.warning(
@@ -1654,34 +1694,37 @@ class GeminiTTSService(GoogleBaseTTSService):
             finish_reason = None
             block_reason = None
 
-            async for chunk in response:
-                feedback = getattr(chunk, "prompt_feedback", None)
-                if feedback and getattr(feedback, "block_reason", None):
-                    block_reason = feedback.block_reason
-                if chunk.candidates and getattr(chunk.candidates[0], "finish_reason", None):
-                    finish_reason = chunk.candidates[0].finish_reason
-                if (
-                    chunk.candidates
-                    and chunk.candidates[0].content
-                    and chunk.candidates[0].content.parts
-                ):
-                    for part in chunk.candidates[0].content.parts:
-                        if part.inline_data:
-                            audio_bytes = part.inline_data.data
-                            if not audio_bytes:
-                                continue
+            # Consumed under aclosing so a stream we give up on (stalled,
+            # interrupted, or failed on a chunk) is closed right away.
+            async with aclosing(self._iter_genai_stream(response, len(text))) as stream:
+                async for chunk in stream:
+                    feedback = getattr(chunk, "prompt_feedback", None)
+                    if feedback and getattr(feedback, "block_reason", None):
+                        block_reason = feedback.block_reason
+                    if chunk.candidates and getattr(chunk.candidates[0], "finish_reason", None):
+                        finish_reason = chunk.candidates[0].finish_reason
+                    if (
+                        chunk.candidates
+                        and chunk.candidates[0].content
+                        and chunk.candidates[0].content.parts
+                    ):
+                        for part in chunk.candidates[0].content.parts:
+                            if part.inline_data:
+                                audio_bytes = part.inline_data.data
+                                if not audio_bytes:
+                                    continue
 
-                            if not first_chunk_for_ttfb:
-                                await self.stop_ttfb_metrics()
-                                first_chunk_for_ttfb = True
+                                if not first_chunk_for_ttfb:
+                                    await self.stop_ttfb_metrics()
+                                    first_chunk_for_ttfb = True
 
-                            audio_buffer += audio_bytes
-                            while len(audio_buffer) >= CHUNK_SIZE:
-                                piece = audio_buffer[:CHUNK_SIZE]
-                                audio_buffer = audio_buffer[CHUNK_SIZE:]
-                                yield TTSAudioRawFrame(
-                                    piece, self.sample_rate, 1, context_id=context_id
-                                )
+                                audio_buffer += audio_bytes
+                                while len(audio_buffer) >= CHUNK_SIZE:
+                                    piece = audio_buffer[:CHUNK_SIZE]
+                                    audio_buffer = audio_buffer[CHUNK_SIZE:]
+                                    yield TTSAudioRawFrame(
+                                        piece, self.sample_rate, 1, context_id=context_id
+                                    )
 
             if audio_buffer:
                 yield TTSAudioRawFrame(audio_buffer, self.sample_rate, 1, context_id=context_id)
@@ -1695,5 +1738,59 @@ class GeminiTTSService(GoogleBaseTTSService):
         except Exception as e:
             # Non-fatal, with the original exception attached (e.g. a
             # google.genai ClientError with code 400/403 for an invalid key, 429
-            # for an exhausted quota) so the application can tell why TTS failed.
+            # for an exhausted quota, GeminiTTSStreamTimeoutError for a stall) so
+            # the application can tell why TTS failed.
             yield ErrorFrame(error=f"Gemini GenAI TTS generation error: {str(e)}", exception=e)
+
+    async def _iter_genai_stream(
+        self, response: AsyncIterator[Any], text_length: int
+    ) -> AsyncGenerator[Any, None]:
+        """Yield streamed chunks, giving up if the stream stalls before any of them.
+
+        Every chunk, the first included, is bounded by ``stream_idle_timeout_secs``
+        (when set). The timeout covers the gap between chunks rather than the
+        utterance as a whole, so a slow but healthy stream is never cut short.
+
+        Args:
+            response: The streamed response to consume.
+            text_length: The length of the text being synthesized, for the error.
+
+        Yields:
+            Each chunk of the streamed response.
+
+        Raises:
+            GeminiTTSStreamTimeoutError: If the next chunk doesn't arrive in time.
+        """
+        chunks = response.__aiter__()
+        timeout = self._stream_idle_timeout_secs
+        received = 0
+        try:
+            while True:
+                try:
+                    if timeout is None:
+                        chunk = await chunks.__anext__()
+                    else:
+                        try:
+                            chunk = await asyncio.wait_for(chunks.__anext__(), timeout=timeout)
+                        except TimeoutError as e:
+                            # Only the length of the text is logged: it is call content.
+                            logger.warning(
+                                f"{self}: Gemini TTS stream stalled for {timeout}s "
+                                f"(text length {text_length}, chunks received {received})"
+                            )
+                            raise GeminiTTSStreamTimeoutError(timeout, text_length, received) from e
+                except StopAsyncIteration:
+                    return
+                received += 1
+                yield chunk
+        finally:
+            # Release the HTTP resources held by a stream we walk away from.
+            # Closing is best-effort: the client's stream type only promises
+            # AsyncIterator, which has no aclose(). A failure to close must not
+            # replace the error that got us here, such as a stall's timeout.
+            aclose = getattr(response, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception as e:
+                    logger.debug(f"{self}: error closing the TTS response stream: {e!r}")
