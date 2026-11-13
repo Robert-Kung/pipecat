@@ -148,6 +148,8 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         settings: Settings | None = None,
         retry_timeout_secs: float | None = 5.0,
         retry_on_timeout: bool | None = False,
+        first_chunk_timeout_secs: float | None = None,
+        stream_idle_timeout_secs: float | None = None,
         **kwargs,
     ):
         """Initialize the BaseOpenAILLMService.
@@ -175,6 +177,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 parameters, ``settings`` values take precedence.
             retry_timeout_secs: Request timeout in seconds. Defaults to 5.0 seconds.
             retry_on_timeout: Whether to retry the request once if it times out.
+            first_chunk_timeout_secs: How long to wait for the first streamed chunk
+                before ending the completion with an ``LLM completion timeout``
+                error. ``None`` (the default) waits as long as the HTTP client does.
+            stream_idle_timeout_secs: How long to wait for each later chunk. A
+                stream that stops producing without closing otherwise stays open
+                until the HTTP client's read timeout. ``None`` disables the bound.
             **kwargs: Additional arguments passed to the parent LLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -221,6 +229,8 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         self._service_tier = service_tier
         self._retry_timeout_secs = retry_timeout_secs
         self._retry_on_timeout = retry_on_timeout
+        self._first_chunk_timeout_secs = first_chunk_timeout_secs
+        self._stream_idle_timeout_secs = stream_idle_timeout_secs
         self._full_model_name: str = ""
         self._client = self.create_client(
             api_key=api_key,
@@ -414,6 +424,24 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         return response.choices[0].message.content
 
+    async def _bounded_chunks(self, chunk_iter):
+        """Yield streamed chunks, raising ``TimeoutError`` if the stream stalls.
+
+        The first chunk is bounded by ``first_chunk_timeout_secs`` and every later
+        one by ``stream_idle_timeout_secs``; ``None`` leaves that wait unbounded.
+        """
+        timeout = self._first_chunk_timeout_secs
+        while True:
+            try:
+                if timeout is None:
+                    chunk = await chunk_iter.__anext__()
+                else:
+                    chunk = await asyncio.wait_for(chunk_iter.__anext__(), timeout=timeout)
+            except StopAsyncIteration:
+                return
+            yield chunk
+            timeout = self._stream_idle_timeout_secs
+
     @traced_llm
     async def _process_context(self, context: LLMContext):
         functions_list = []
@@ -463,7 +491,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     await stream.aclose()
 
         async with _closing(chunk_stream) as chunk_iter:
-            async for chunk in chunk_iter:
+            async for chunk in self._bounded_chunks(chunk_iter):
                 if chunk.usage:
                     cached_tokens = (
                         chunk.usage.prompt_tokens_details.cached_tokens
@@ -614,7 +642,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 await self.push_frame(LLMFullResponseStartFrame())
                 await self.start_processing_metrics()
                 await self._process_context(frame.context)
-            except httpx.TimeoutException as e:
+            except (httpx.TimeoutException, TimeoutError) as e:
                 await self._call_event_handler("on_completion_timeout")
                 await self.push_error(error_msg="LLM completion timeout", exception=e)
             except Exception as e:
