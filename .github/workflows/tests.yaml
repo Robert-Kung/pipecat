@@ -48,6 +48,7 @@ jobs:
             --extra google \
             --extra langchain \
             --extra livekit \
+            --extra meta \
             --extra pgmq \
             --extra piper \
             --extra redis \
