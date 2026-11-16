@@ -398,10 +398,14 @@ class MuseSTTService(STTService):
 
     async def _activate(self, ws: aiohttp.ClientWebSocketResponse):
         """Send buffered audio, then make ``ws`` the stream audio goes to."""
-        while self._pending_audio:
-            chunk = self._pending_audio.popleft()
-            self._pending_audio_bytes -= len(chunk)
-            await ws.send_bytes(chunk)
+        try:
+            while self._pending_audio:
+                chunk = self._pending_audio.popleft()
+                self._pending_audio_bytes -= len(chunk)
+                await ws.send_bytes(chunk)
+        except Exception:
+            await self._close_quietly(ws)
+            raise
         self._ws = ws
         self._reset_turns()
         await self._call_event_handler("on_connected")

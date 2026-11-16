@@ -6,6 +6,7 @@
 
 """Unit tests for OpenAI LLM error handling."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -376,3 +377,33 @@ def test_openai_llm_stream_timeouts_are_off_by_default():
         service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
     assert service._first_chunk_timeout_secs is None
     assert service._stream_idle_timeout_secs is None
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_first_chunk_timeout_covers_a_request_whose_response_never_starts():
+    with patch.object(OpenAILLMService, "create_client"):
+        service = OpenAILLMService(
+            settings=OpenAILLMService.Settings(model="gpt-4"), first_chunk_timeout_secs=0.05
+        )
+
+    async def never_responds(_context):
+        await asyncio.sleep(30)
+
+    errors = []
+
+    async def mock_push_error(error_msg, exception=None):
+        errors.append(error_msg)
+
+    service.push_frame = AsyncMock()
+    service.push_error = mock_push_error
+    service._call_event_handler = AsyncMock()
+    service.start_processing_metrics = AsyncMock()
+    service.stop_processing_metrics = AsyncMock()
+    service.start_ttfb_metrics = AsyncMock()
+    service.get_chat_completions = never_responds
+    context = LLMContext(messages=[{"role": "user", "content": "Hello"}])
+    await asyncio.wait_for(
+        service.process_frame(LLMContextFrame(context=context), FrameDirection.DOWNSTREAM),
+        timeout=2,
+    )
+    assert errors == ["LLM completion timeout"]

@@ -360,3 +360,31 @@ async def test_connection_goes_through_explicit_proxy(monkeypatch):
     assert connects and connects[0].startswith("CONNECT api.meta.ai:443")
     assert info.value.phase == "connect"
     assert API_KEY not in str(info.value)
+
+
+@pytest.mark.asyncio
+async def test_stream_that_fails_while_flushing_buffered_audio_is_closed(fake):
+    service, _, errors, _ = make_service()
+    service._buffer_audio(b"\0" * CHUNK_BYTES)
+
+    class BrokenWs:
+        closed = False
+
+        async def send_bytes(self, data):
+            raise ConnectionResetError("reset right after handshake")
+
+        async def close(self):
+            BrokenWs.closed = True
+
+    async def open_stream():
+        return BrokenWs()
+
+    service._open_stream = open_stream
+    service._http = aiohttp.ClientSession()
+    await service._connect()
+    try:
+        assert BrokenWs.closed
+        assert service._ws is None
+        assert errors and errors[0][2] is False
+    finally:
+        await stop_service(service)

@@ -440,13 +440,14 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         return response.choices[0].message.content
 
-    async def _bounded_chunks(self, chunk_iter):
+    async def _bounded_chunks(self, chunk_iter, first_timeout: float | None):
         """Yield streamed chunks, raising ``TimeoutError`` if the stream stalls.
 
-        The first chunk is bounded by ``first_chunk_timeout_secs`` and every later
-        one by ``stream_idle_timeout_secs``; ``None`` leaves that wait unbounded.
+        The first chunk is bounded by ``first_timeout`` (what is left of
+        ``first_chunk_timeout_secs`` after the request) and every later one by
+        ``stream_idle_timeout_secs``; ``None`` leaves that wait unbounded.
         """
-        timeout = self._first_chunk_timeout_secs
+        timeout = first_timeout
         while True:
             try:
                 if timeout is None:
@@ -482,8 +483,19 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         await self.start_ttfb_metrics()
 
-        # Generate chat completions from LLMContext
-        chunk_stream = await self.get_chat_completions(context)
+        # Generate chat completions from LLMContext. The first-chunk deadline also
+        # covers the request itself: a response whose headers never arrive would
+        # otherwise wait for the HTTP client's read timeout.
+        first_timeout = self._first_chunk_timeout_secs
+        if first_timeout is None:
+            chunk_stream = await self.get_chat_completions(context)
+        else:
+            loop = asyncio.get_running_loop()
+            requested_at = loop.time()
+            chunk_stream = await asyncio.wait_for(
+                self.get_chat_completions(context), timeout=first_timeout
+            )
+            first_timeout = max(0.0, first_timeout - (loop.time() - requested_at))
 
         # Ensure stream and its async iterator are closed on cancellation/exception
         # to prevent socket leaks and uvloop crashes. Closing the iterator first
@@ -507,7 +519,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     await stream.aclose()
 
         async with _closing(chunk_stream) as chunk_iter:
-            async for chunk in self._bounded_chunks(chunk_iter):
+            async for chunk in self._bounded_chunks(chunk_iter, first_timeout):
                 if chunk.usage:
                     cached_tokens = (
                         chunk.usage.prompt_tokens_details.cached_tokens
