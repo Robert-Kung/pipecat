@@ -150,6 +150,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         retry_on_timeout: bool | None = False,
         first_chunk_timeout_secs: float | None = None,
         stream_idle_timeout_secs: float | None = None,
+        fallback_user_message: str | None = None,
         **kwargs,
     ):
         """Initialize the BaseOpenAILLMService.
@@ -183,6 +184,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             stream_idle_timeout_secs: How long to wait for each later chunk. A
                 stream that stops producing without closing otherwise stays open
                 until the HTTP client's read timeout. ``None`` disables the bound.
+            fallback_user_message: Appended as a ``user`` message to a request
+                whose messages contain no ``user`` or ``tool`` entry (e.g. an
+                opening turn that carries only the system prompt), for endpoints
+                that reject such requests. Only the outgoing request changes; the
+                context is left untouched. ``None`` (the default) sends the
+                messages as-is.
             **kwargs: Additional arguments passed to the parent LLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -231,6 +238,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         self._retry_on_timeout = retry_on_timeout
         self._first_chunk_timeout_secs = first_chunk_timeout_secs
         self._stream_idle_timeout_secs = stream_idle_timeout_secs
+        self._fallback_user_message = fallback_user_message
         self._full_model_name: str = ""
         self._client = self.create_client(
             api_key=api_key,
@@ -373,6 +381,14 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         # Messages, tools, tool_choice
         params.update(params_from_context)
+
+        if self._fallback_user_message is not None:
+            messages = params.get("messages") or []
+            if not any(m.get("role") in ("user", "tool") for m in messages):
+                params["messages"] = [
+                    *messages,
+                    {"role": "user", "content": self._fallback_user_message},
+                ]
 
         params.update(self._settings.extra)
 
